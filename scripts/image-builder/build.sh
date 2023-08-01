@@ -241,7 +241,7 @@ createrepo microshift-local >/dev/null
 
 # Download openshift local RPM packages (noarch for python and selinux packages)
 rm -rf openshift-local 2>/dev/null || true
-reposync -n -a ${BUILD_ARCH} -a noarch --download-path openshift-local \
+reposync -a ${BUILD_ARCH} -a noarch --download-path openshift-local \
     --repo=rhocp-4.12-el8-beta-${BUILD_ARCH}-rpms \
     --repo=fast-datapath-for-rhel-8-${BUILD_ARCH}-rpms >/dev/null
 #   --repo=rhocp-4.12-for-rhel-8-${BUILD_ARCH}-rpms \
