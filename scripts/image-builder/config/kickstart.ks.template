@@ -82,7 +82,8 @@ RuntimeMaxUse=1G
 EOF
 
 # Make sure all the Ethernet network interfaces are connected automatically
-    systemctl is-active NetworkManager
+set -e 
+systemctl is-active NetworkManager
 for uuid in $(nmcli -f uuid,type,autoconnect connection | awk '$2 == "ethernet" && $3 == "no" {print $1}') ; do
     echo $uuid
     # Remove autoconnect option from the configuration file to keep it enabled after reboot
