@@ -83,6 +83,7 @@ EOF
 
 # Make sure all the Ethernet network interfaces are connected automatically
 set -x
+nmcli conn show
 for uuid in $(nmcli -f uuid,type,autoconnect connection | awk '$2 == "ethernet" && $3 == "no" {print $1}') ; do
     echo $uuid
     # Remove autoconnect option from the configuration file to keep it enabled after reboot
