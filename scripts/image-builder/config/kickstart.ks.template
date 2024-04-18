@@ -83,14 +83,14 @@ EOF
 
 # Make sure all the Ethernet network interfaces are connected automatically
 set -x
-nmcli conn show
-for uuid in $(nmcli -f uuid,type,autoconnect connection | awk '$2 == "ethernet" && $3 == "no" {print $1}') ; do
-    echo $uuid
-    # Remove autoconnect option from the configuration file to keep it enabled after reboot
-    file=$(nmcli -f uuid,filename connection | awk -v uuid=${uuid} '$1 == uuid' | sed "s/${uuid}//g" | xargs)
-    echo $files
-    sed -i '/autoconnect=.*/d' "${file}"
-done
+find /etc/NetworkManager -name "*.nmcon*" | xargs sed -i '/autoconnect=false/d'
+#for uuid in $(nmcli -f uuid,type,autoconnect connection | awk '$2 == "ethernet" && $3 == "no" {print $1}') ; do
+#.    echo $uuid
+#    # Remove autoconnect option from the configuration file to keep it enabled after reboot
+#    file=$(nmcli -f uuid,filename connection | awk -v uuid=${uuid} '$1 == uuid' | sed "s/${uuid}//g" | xargs)
+#    echo $files
+#    sed -i '/autoconnect=.*/d' "${file}"
+#done
 
 # Update certificate trust storage in case new certificates were
 # installed at /etc/pki/ca-trust/source/anchors directory
