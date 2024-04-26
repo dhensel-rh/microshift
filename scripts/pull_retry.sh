@@ -2,6 +2,7 @@
 set -xuo pipefail
 #
 # Use this script to avoid image pull getting stuck once MicroShift tries to
+# Use this script to avoid image pull getting stuck once MicroShift tries to
 # do so in runtime.
 #
 
