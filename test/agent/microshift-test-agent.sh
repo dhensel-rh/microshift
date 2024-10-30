@@ -1,9 +1,9 @@
-#!/bin/bash
-
+#!/usr/bin/bash
 set -xeuo pipefail
 
 GREENBOOT_CONFIGURATION_FILE=/etc/greenboot/greenboot.conf
 AGENT_CFG=/var/lib/microshift-test-agent.json
+SYSTEMD_NOTIFIED=false
 
 # Example config
 # {
@@ -17,12 +17,16 @@ AGENT_CFG=/var/lib/microshift-test-agent.json
 
 CLEANUP_CMDS=()
 _cleanup() {
+    # Make sure to always notify systemd if the script exited without
+    # sending an explicit notification
+    _notify_systemd
+
     for cmd in "${CLEANUP_CMDS[@]}"; do
         ${cmd}
     done
     exit 0
 }
-trap "_cleanup" SIGTERM SIGQUIT INT
+trap "_cleanup" EXIT
 
 _run_actions() {
     local -r actions="${1}"
@@ -31,7 +35,7 @@ _run_actions() {
     fi
 
     num=$(echo "${actions}" | jq -c ". | length")
-    for i in $(seq 0 $((num - 1))); do
+    for ((i=0; i <num; i++)); do
         action=$(echo "${actions}" | jq -c -r ".[${i}]")
 
         if ! declare -F "${action}"; then
@@ -46,6 +50,7 @@ _debug_info() {
     grub2-editenv - list || true
     ostree admin status -v || true
     rpm-ostree status -v || true
+    bootc status || true
     journalctl --list-boots --reverse | head -n6 || true
     ls -lah /var/lib/ || true
     ls -lah /var/lib/microshift || true
@@ -79,6 +84,23 @@ _get_current_boot_number() {
     echo "$((max_boot_attempts - boot_counter))"
 }
 
+_get_current_deployment_id() {
+    local -r id="$(rpm-ostree status --booted --json | jq -r ".deployments[0].id")"
+    echo "${id}"
+}
+
+_notify_systemd() {
+    # Avoid double notification
+    if ${SYSTEMD_NOTIFIED} ; then
+        return
+    fi
+
+    if [ -n "${NOTIFY_SOCKET:-}" ] ; then
+        systemd-notify --ready
+    fi
+    SYSTEMD_NOTIFIED=true
+}
+
 prevent_backup() {
     local -r path="/var/lib/microshift-backups"
     if [[ ! -e "${path}" ]]; then
@@ -95,7 +117,7 @@ prevent_backup() {
 fail_greenboot() {
     local -r path="/etc/greenboot/check/required.d/99_microshift_test_failure.sh"
     cat >"${path}" <<EOF
-#!/bin/bash
+#!/usr/bin/bash
 echo 'Forced greenboot failure by MicroShift Failure Agent'
 sleep 5
 exit 1
@@ -109,13 +131,21 @@ EOF
 # problem with groups. Following line ensures that sshd's keys are owned by
 # ssh_keys group and not some other.
 # When removing, change Before= in microshift-test-agent.service
-chown -v root:ssh_keys /etc/ssh/ssh_host*key
+if [ -d /etc/ssh ] ; then
+    find /etc/ssh -name 'ssh_host*key' -exec chown -v root:ssh_keys {} \;
+else
+    echo "The /etc/ssh directory does not exist, skipping file ownership update"
+fi
 # WORKAROUND END
 
 _debug_info
 
+if [ ! -f "${AGENT_CFG}" ] ; then
+    exit 0
+fi
+
 current_boot="$(_get_current_boot_number)"
-current_deployment_id=$(rpm-ostree status --booted --json | jq -r ".deployments[0].id")
+current_deployment_id="$(_get_current_deployment_id)"
 
 deploy=$(jq -c ".\"${current_deployment_id}\"" "${AGENT_CFG}")
 if [[ "${deploy}" == "null" ]]; then
@@ -128,5 +158,14 @@ current_boot_actions=$(echo "${deploy}" | jq -c ".\"${current_boot}\"")
 _run_actions "${every_boot_actions}"
 _run_actions "${current_boot_actions}"
 
-# sleep until the reboot, will run cleanup upon exit
-sleep infinity
+# If running under systemd, notify systemd that the service is ready so that
+# other dependent services in the startup sequence can be started
+_notify_systemd
+
+# Sleep in background and wait to not miss the signals. If sleep command is
+# interrupted, wait error is ignored and the loop continues. If the script
+# is interrupted, it exits and calls cleanup commands.
+while true ; do
+    sleep infinity &
+    wait $! || true
+done

@@ -57,7 +57,7 @@ many of the tests will try to download that file to connect to the API
 remotely.
 
 `USHIFT_USER` should be the username for logging in to `USHIFT_HOST`
-remotely via ssh.
+remotely via ssh and have sudo permission without password.
 
 `SSH_PRIV_KEY` should be an ssh key file to use for authenticating as
 `USHIFT_USER`. The key must not require a password. To connect to
@@ -69,6 +69,14 @@ the ssh agent to provide the correct credentials.
 
 `API_PORT` should be set when connections are performed through a
 forwarded port.
+
+To ensure the router smoke test works properly on a Microshift host,
+you need to install the `avahi-resolve-host-name` command, which is
+essential for hostname resolution. You can install it using the following command:
+
+```
+sudo dnf install -y avahi-tools
+```
 
 ### Running Tests
 
@@ -97,7 +105,7 @@ By default, all of the test suites will be run. To run a subset,
 specify the filenames as arguments on the command line.
 
 ```
-$ ./test/run.sh suites/show-config.robot
+$ ./test/run.sh suites/standard/show-config.robot
 ```
 
 > The test suite file names should be relative to the `test` directory.
@@ -112,13 +120,13 @@ files must also be specified explicitly in all of these cases.
 To run tests with names matching a pattern, use the `-t` option:
 
 ```
-$ ./test/run.sh -- -t '*No Mode*' suites/show-config.robot
+$ ./test/run.sh -- -t '*No Mode*' suites/standard/show-config.robot
 ```
 
 To run tests with specific tags, use the `-i` option:
 
 ```
-$ ./test/run.sh -- -i etcd suites/*.robot
+$ ./test/run.sh -- -i etcd suites/*/*.robot
 ```
 
 For more options, see the help output for the `robot` command.
@@ -158,26 +166,26 @@ rhsm = true
 ### Image Blueprints
 
 The image blueprints are independent of the test scenarios so that
-images can be reused. Be careful making changes to specific images in
-case the change affects the way the image is used in different
-scenarios. Be careful adding unnecessary new images, since each image
-takes time to build and may slow down the overall test job.
+images can be reused.
 
-Images are organized into "groups". Each group is built in order and
-all of the images in a group are built in parallel.
+Images are organized into "layers" that contain "groups".
 
-Add blueprints as TOML files in the appropriate group directory in the
-`./test/image-blueprints` directory, then add a short description of the
-image here for reference.
+Each layer has its designation:
+- `base` layer is a prerequisite for all the subsequent ones
+- `presubmit` layer contains images used in presubmit CI jobs
+- `periodic` layer contains images used in periodic CI jobs
 
-Blueprint | Group | Image Name | Purpose
---------- | ----- | ---------- | -------
-rhel92.toml | group1 | rhel-9.2 | A simple RHEL image without MicroShift.
-rhel92-microshift-previous-minor.toml | group2 | rhel-9.2-microshift-4.13 | A RHEL 9.2 image with the latest MicroShift from the previous y-stream installed and enabled.
-rhel92-source.toml | group2 | rhel-9.2-microshift-source | A RHEL 9.2 image with the RPMs built from source.
-rhel92-source-fake-next-minor.toml | group2 | rhel-9.2-microshift-4.15 | A RHEL 9.2 image with the RPMs built from source from the current PR but with the _version_ set to the next y-stream.
-rhel92-source-fake-yplus2-minor.toml | group2 | rhel-9.2-microshift-4.16 | A RHEL 9.2 image with the RPMs built from source from the current PR but with the _version_ set to the current+2 y-stream.
-rhel92-crel.toml | group2 | rhel-9.2-microshift-crel | A RHEL 9.2 image with MicroShift RPMs already built and released by ART like ECs, RCs, and Z-stream releases.
+Layers are built one after the other. Each group in a given layer is built
+sequentially and all of the images in a group are built in parallel.
+
+New blueprints can be added as TOML files in the appropriate layer and
+group directories under `./test/image-blueprints`.
+
+> **Warning**
+> - Making changes to specific images may affect the way the image is used
+> in different scenarios.
+> - Each image takes time to build and adding unnecessary new images may
+> slow down the overall test job.
 
 #### Blueprint Customization
 
@@ -199,18 +207,16 @@ RENDER_CONTAINER_IMAGES="${SOURCE_VERSION}"
 
 #### Blueprint Naming
 
-Blueprint names must be globally unique, regardless of the group that
-contains the blueprint template.
+Blueprint names must be globally unique, regardless of the layer and group
+that contains the blueprint template.
 
 Blueprint names should clearly identify the combination of operating
 system and MicroShift versions. The convention is to put the operating
-system first, followed by `microshift`. For example,
-`rhel-9.2-microshift-4.13`.
+system first, followed by `microshift` (i.e `rhel-9.2-microshift-4.13`).
 
 Regardless of the branch, the blueprints using MicroShift built from
 the source PR should use `source` in the name to facilitate rebuilding
-only the source-based images. For example,
-`rhel-9.2-microshift-source`.
+only the source-based images (i.e `rhel-9.2-microshift-source`).
 
 To make it easy to include the right image in a test scenario, each
 blueprint produces an edge-commit image identified with a `ref` that
@@ -225,8 +231,8 @@ before the first dash (`-`) in the filename and then using that to find
 the blueprint **template** file, and ultimately the blueprint **name**.
 
 For example, `rhel92-microshift-source` has prefix `rhel92`. There is
-a blueprint template `./test/image-blueprints/group1/rhel92.toml` that
-contains the name `rhel-9.2`, so when the image for
+a blueprint template `./test/image-blueprints/layer1-base/group1/rhel92.toml`
+that contains the name `rhel-9.2`, so when the image for
 `rhel92-microshift-source` is built, the parent is configured as the
 `rhel-9.2` image.
 
@@ -240,7 +246,7 @@ example, to create an alias `rhel-9.2-microshift-source-aux` for
 `rhel-9.2-microshift-source`:
 
 ```
-$ cat ./test/image-blueprints/group2/rhel-9.2-microshift-source-aux.alias
+$ cat ./test/image-blueprints/layer2-presubmit/group1/rhel-9.2-microshift-source-aux.alias
 rhel-9.2-microshift-source
 ```
 
@@ -252,9 +258,27 @@ blueprint to base the image on. For example, to create a `rhel92.iso`
 file from the `rhel-9.2` blueprint:
 
 ```
-$ cat ./test/image-blueprints/group1/rhel92.image-installer
+$ cat ./test/image-blueprints/layer1-base/group1/rhel92.image-installer
 rhel-9.2
 ```
+
+### Downloaded ISO Images
+
+To download a pre-built ISO image from the Internet, create a file with
+the extension `.image-fetcher` containing the URL of the image to be fetched.
+The name of the downloaded image will be derived from the base name of the
+file with the `.iso` extension.
+
+For example, create a `centos9.image-fetcher` file with a link to the CentOS 9
+ISO image. The downloaded file will be named `centos9.iso`.
+
+```
+$ cat ./test/image-blueprints/layer1-base/group1/centos9.image-fetcher
+https://mirrors.centos.org/mirrorlist?path=/9-stream/BaseOS/{{ .Env.UNAME_M }}/iso/CentOS-Stream-9-latest-{{ .Env.UNAME_M }}-dvd1.iso&redirect=1&protocol=https
+```
+
+> Note that the `.image-fetcher` file contents may contain Go template expressions
+> that will be expanded at runtime.
 
 ### Preparing to Run Test Scenarios
 
@@ -264,31 +288,31 @@ The steps in this section need to be executed on a `development host`.
 
 The upgrade and rollback test scenarios use multiple builds of
 MicroShift to create images with different versions. Use
-`./test/bin/build_rpms.sh` to build all of the necessary packages.
-
-#### Creating Local RPM Repositories
-
-After building RPMs, run `./test/bin/create_local_repo.sh` to copy the
-necessary files into locations that can be used as RPM repositories by
-Image Builder.
+`./test/bin/build_rpms.sh` to build all of the necessary packages and
+copy the necessary files into locations that can be used as RPM repositories
+by Image Builder.
 
 #### Creating Images
 
-Use `./test/bin/start_osbuild_workers.sh` to create multiple workers for
-building images in parallel. The image build process is mostly CPU and I/O
-intensive. For a development environment, setting the number of workers to
-half of the CPU number may be a good starting point.
+Use `./test/bin/manage_composer_config.sh` to set up the system for building
+images. Create the configuration and start the webserver using `create`.
 
 ```
-NCPUS=$(lscpu | grep '^CPU(s):' | awk '{print $2}')
-./test/bin/start_osbuild_workers.sh $((NCPUS / 2))
+$ ./test/bin/manage_composer_config.sh create
+```
+
+Optionally, use `create-workers [num_workers]` to create multiple workers for building 
+images in parallel. The image build process is mostly CPU and I/O
+intensive. For a development environment, setting the number of workers to
+half of the CPU number may be a good starting point. If no `num_workers` is set, the script
+determines the ideal number of workers based on the number of CPU cores available.
+
+```
+$ ./test/bin/manage_composer_config.sh create-workers
 ```
 
 > This setting is optional and not necessarily recommended for configurations
 > with small number of CPUs and limited disk performance.
-
-Use `./test/bin/start_webserver.sh` to run an `nginx` web server to serve the
-images needed for the build.
 
 Use `./test/bin/build_images.sh` to build all of the images for all of the
 blueprints available.
@@ -300,14 +324,6 @@ images that use RPMs created from source (not already published releases).
 ```
 ./test/bin/build_images.sh -s
 ```
-
-#### Rebuilding from Sources Easily
-
-If you build new RPMs, you need to re-run several steps (build the
-RPMs, build the local repos, build the images, download the images).
-Use `./bin/rebuild_source_images.sh` to automate all of those
-steps with one script while only rebuilding the images that use RPMs
-created from source (not already published releases).
 
 ### Configuring Test Scenarios
 
@@ -324,15 +340,29 @@ MICROSHIFT_HOST=microshift-dev
 mkdir -p _output/test-images
 scp -r microshift@${MICROSHIFT_HOST}:microshift/_output/test-images/ _output/
 ```
+#### Mirroring the container registry
+In order to avoid possible disruptions from external sources such as container
+registries, container registry is mirrored locally for all the images MicroShift
+requires.
+
+The registry will contain all images extracted from previously built MicroShift
+RPMs in the `build` phase (taken from `microshift-release-info`).
+A quay mirror is configured in the hypervisor, all images are downloaded from
+their original registry and pushed into the new one. Each of the scenarios
+will inject the mirror's configuration automatically. Access to the mirror
+uses credentials and TLS.
+
+This is enabled by default in `./test/bin/ci_phase_iso_boot.sh`, as it makes
+pipelines more robust.
+It is disabled by default in each of the scenarios to ease development cycle.
+It is uncommon to run the full `./test/bin/ci_phase_iso_boot.sh` outside of
+CI as it requires a powerful machine.
 
 #### Global Settings
 
 The test scenario tool uses several global settings that may be
 configured before the tool is used in `./test/scenario_settings.sh`.
 You can copy `./test/scenario_settings.sh.example` as a starting point.
-
-`PUBLIC_IP` -- The public IP of the hypervisor, when accessing VMs
-remotely through port-forwarded connections.
 
 `SSH_PUBLIC_KEY` -- The name of the public key file to use for
 providing password-less access to the VMs.
@@ -349,6 +379,15 @@ necessary. Do not enable this option in CI.
 is useful in local developer settings where cockpit can be used to
 login to the host. Set to `true` to enable. Defaults to `false`.
 
+`SUBSCRIPTION_MANAGER_PLUGIN` -- Should be the full path to a bash
+script that can be sourced to provide a function called
+`subscription_manager_register`. The function must take 1 argument,
+the name of the VM within the current scenario. It should update that
+VM so that it is registered with a Red Hat software subscription to
+allow packages to be installed. The default implementation handles the
+automated workflow used in CI and a manual workflow useful for
+developers running a single scenario interactively.
+
 #### Configuring Hypervisor
 
 Use `./test/bin/manage_hypervisor_config.sh` to manage the following
@@ -356,6 +395,7 @@ hypervisor settings:
 - Firewall
 - Storage pools used for VM images and disks
 - Isolated networks
+- Nginx webserver for serving images used in scenarios
 
 Create the necessary configuration using `create`.
 
@@ -376,15 +416,12 @@ $ ./test/bin/manage_hypervisor_config.sh cleanup
 
 #### Creating Test Infrastructure
 
-Use `./test/bin/start_webserver.sh` to run an `nginx` web server to serve the
-images needed for the test scenarios.
-
 Use `./test/bin/scenario.sh` to create test infrastructure for a scenario
 with the `create` argument and a scenario directory name as input.
 
 ```
 $ ./test/bin/scenario.sh create \
-      ./test/scenarios/rhel-9.2-microshift-source-standard-suite.sh
+      ./test/scenarios/el92-src@standard-suite.sh
 ```
 
 #### Enabling Connections to VMs
@@ -416,7 +453,7 @@ the scenario.
 ```
 $ ./scripts/fetch_tools.sh robotframework
 $ ./test/bin/scenario.sh run \
-      ./test/scenarios/rhel-9.2-microshift-source-standard-suite.sh
+      ./test/scenarios/el92-src@standard-suite.sh
 ```
 
 ### Scenario Definitions
@@ -429,18 +466,17 @@ combination of images and tests that make up the scenario.
 
 The scenario script should be defined with a combination of the RHEL
 version(s), MicroShift version(s), and an indication of what sort of
-tests are being run. For example,
-`rhel-9.2-microshift-source-standard-suite.sh` runs the standard test
-suite (not the `ostree` upgrade tests) against MicroShift built from
-source running on a RHEL 9.2 image.
+tests are being run. For example, `el92-src@standard-suite.sh` runs
+the standard test suite (not the `ostree` upgrade tests) against
+MicroShift built from source running on a RHEL 9.2 image.
 
 Scenarios define VMs using short names, like `host1`, which are made
 unique across the entire set of scenarios. VMs are not reused across
 scenarios.
 
-Scenarios use images defined by the blueprints created
-earlier. Blueprints and images are reused between scenarios. Refer to
-"Image Blueprints" above for details.
+Scenarios use images defined by the blueprints created earlier. Blueprints
+and images are reused between scenarios. Refer to "Image Blueprints" above
+for details.
 
 Scenarios use kickstart templates from the `./test/kickstart-templates`
 directory. Kickstart templates are reused between scenarios.
@@ -509,6 +545,14 @@ the primary host to use for connecting and any arguments to be given
 to `robot`, including the test suites and any unique variables that
 are not saved to the default variables file by the framework.
 
+The `robot` command uses the following options that can be overridden
+as an environment setting in scenario files:
+* `TEST_RANDOMIZATION=all` for running the tests in a random order
+* `TEST_EXECUTION_TIMEOUT=30m` for timing out on tests that run longer than expected
+
+> Execution timeout is disabled with running the scenario script in the
+> interactive mode to allow convenient interruption from the terminal.
+
 ## Troubleshooting
 
 ### Accessing VMs
@@ -534,6 +578,21 @@ needed images. Rebuilds MicroShift RPMs from source, sets up RPM repo,
 sets up Image Builder workers, builds the images, and creates the web
 server to host the images.
 
+The script implements the following build time optimizations depending
+on the runtime environment:
+* When the `CI_JOB_NAME` environment variable is defined
+  * The `layer3-periodic` groups are built only if the job name contains
+    the`periodic` substring.
+* When access to the `microshift-build-cache` AWS S3 Bucket is configured
+  * If the script is run with the `-update_cache` command line argument, it
+    builds `layer1-base` groups and uploads them to the S3 bucket.
+  * If the script is run without command line arguments, it attempts to
+    download cached `layer1-base` artifacts instead of building them.
+* In any case, the fallback is to perform full builds on all layers.
+
+> See [Image Caching in AWS S3 Bucket](#image-caching-in-aws-s3-bucket)
+> for more information.
+
 ### ci_phase_iso_boot.sh
 
 Runs on the hypervisor. Responsible for launching all of the VMs that
@@ -545,3 +604,112 @@ variable, which defaults to `./test/scenarios`.
 Runs on the hypervisor. Responsible for running all of the scenarios from
 `SCENARIO_SOURCES`, waiting for them to complete and exiting with an
 error code if at least one test failed.
+
+### Image Caching in AWS S3 Bucket
+
+The `ci_phase_iso_build.sh` script attempts to optimizes image build times
+when access to the `microshift-build-cache` AWS S3 Bucket is configured in
+the current environment.
+
+```
+$ ./scripts/fetch_tools.sh awscli
+You can now run: /home/microshift/microshift/_output/bin/aws --version
+
+$ ./_output/bin/aws configure list
+      Name                    Value             Type    Location
+      ----                    -----             ----    --------
+   profile                <not set>             None    None
+access_key     ****************TCBI shared-credentials-file
+secret_key     ****************pc5/ shared-credentials-file
+    region                eu-west-1      config-file    ~/.aws/config
+
+$ ./_output/bin/aws s3 ls
+2023-10-29 08:38:40 microshift-build-cache
+```
+
+#### manage_build_cache.sh
+
+The script abstracts build cache manipulation by implementing an interface
+allowing to `upload`, `download`, `verify` and `cleanup` image build artifact
+data using AWS S3 for storage.
+
+The default name of the bucket is `microshift-build-cache` and it can be
+overriden by setting the `AWS_BUCKET_NAME` environment variable.
+
+The script uses `branch` and `tag` arguments to determine the sub-directories
+for storing the data at `${AWS_BUCKET_NAME}/<branch>/${UNAME_M}/<tag>`. Those
+arguments are set in the `common.sh` script using the following environment
+variables:
+
+* `SCENARIO_BUILD_BRANCH`: the name of the current branch, i.e `main`,
+  `release-4.14`, etc.
+* `SCENARIO_BUILD_TAG`: the current build tag using the `yymmdd` format.
+* `SCENARIO_BUILD_TAG_PREV`: the previous build tag using yesterday's date.
+
+A special `${AWS_BUCKET_NAME}/<branch>/${UNAME_M}/last` file can be set and
+retrieved using `setlast` and `getlast` operations. The file contains the
+name of the last tag with the valid cached data.
+
+The cleanup operation is implemented using the `keep` operation, which deletes
+data from all the tags in the current branch and architecture, except those
+pointed by the `last` file and the `tag` argument.
+
+> Deleting the `last` file and data pointed by it is possible by manipulating
+> the AWS S3 bucket contents directly, using other tools.
+
+#### Update CI Cache Job
+
+Cache update is scheduled as periodic CI jobs named `microshift-metal-cache-nightly`
+and `microshift-metal-cache-nightly-arm`. The jobs run nightly by executing the
+`test/bin/ci_phase_iso_build.sh -update_cache` command.
+
+There are also pre-submit CI jobs named `microshift-metal-cache` and
+`microshift-metal-cache-arm`. The jobs are executed automatically in pull requests
+when any scripts affecting the caching are updated.
+
+> The cache upload operation does not overwrite existing valid cache to avoid
+> race conditions with running jobs. The procedure exits normally in this case.
+> Manual deletion of a cache tag in the AWS S3 bucket is required for forcing
+> an existing cache update.
+
+The job cannot use its current AWS CI account because it is regularly purged of
+all objects older than 1-3 days. Instead, the cached data is stored in the
+MicroShift development AWS account, which does not have the automatic cleanup
+scheduled.
+
+Environment variables are set to affect the AWS CLI command behavior:
+- `AWS_BUCKET_NAME` is set to `microshift-build-cache-${EC2_REGION}` for
+  ensuring that S3 traffic is local to a given region for saving costs.
+- `AWS_PROFILE` is set to `microshift-ci` to ensure that all the AWS CLI
+  commands are using the right credendials and region.
+
+The credentials for accessing the MicroShift development AWS account are stored
+in the vault as described at [Adding a New Secret to CI](https://docs.ci.openshift.org/docs/how-tos/adding-a-new-secret-to-ci/).
+The keys are then mounted for the job and copied to the `~/.aws/config` and
+`~/.aws/credentials` files under the `microshift-ci` profile name.
+
+> The procedure assumes that the `microshift-build-cache-<region>` bucket exists
+> in the appropriate region.
+
+### Local Developer Overrides
+
+In some cases, it is necessary to override default values used by the
+CI scripts to make them work in the local environment. If the file
+`./test/dev_overrides.sh` exists, it is sourced by the test framework
+scripts after initializing the common defaults and before computing
+any per-script defaults.
+
+For example, creating the file with this content
+
+```
+#!/bin/bash
+export AWS_BUCKET_NAME=microshift-build-cache-us-west-2
+export CI_JOB_NAME=local-dev
+```
+
+will ensure that a valid AWS bucket is used as the source of image
+cache data and that scripts that check for the CI job name will have a
+name pattern set to compare.
+
+NOTE: Include the shebang line with the shell set and export variables
+to avoid issues with the shellcheck linter.

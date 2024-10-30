@@ -30,7 +30,8 @@ MicroShift Is Ready
 
 MicroShift Is Live
     [Documentation]    Check the /livez endpoint
-    ${stdout}=    Run With Kubeconfig    oc get --raw='/livez'
+    [Arguments]    ${extra_args}=${EMPTY}
+    ${stdout}=    Run With Kubeconfig    oc get --raw='/livez' ${extra_args}
     Should Be Equal As Strings    ${stdout}    ok    strip_spaces=True
 
 Wait For MicroShift
@@ -80,7 +81,7 @@ Restart MicroShift
     [Documentation]    Restart the MicroShift service
     ${ushift_pid}=    MicroShift Process ID
     ${ushift_etcd_pid}=    MicroShift Etcd Process ID
-    Systemctl With Retry    restart    microshift.service
+    Systemctl    restart    microshift.service
     Wait Until MicroShift Process ID Changes    ${ushift_pid}
     Wait Until MicroShift Etcd Process ID Changes    ${ushift_etcd_pid}
     # Kubeconfig may change between restarts, ensure we are taking the latest one.
@@ -89,17 +90,21 @@ Restart MicroShift
 
 Stop MicroShift
     [Documentation]    Stop the MicroShift service
-    Systemctl With Retry    stop    microshift.service
+    Systemctl    stop    microshift.service
 
 Start MicroShift
     [Documentation]    Start the MicroShift service
-    Systemctl With Retry    start    microshift.service
+    Systemctl    start    microshift.service
     # Kubeconfig may change between restarts, ensure we are taking the latest one.
     Setup Kubeconfig
 
 Enable MicroShift
     [Documentation]    Enable the MicroShift service
     Systemctl    enable    microshift.service
+
+Disable MicroShift
+    [Documentation]    Disable the MicroShift service
+    Systemctl    disable    microshift.service
 
 Cleanup MicroShift
     [Documentation]    Cleanup MicroShift data

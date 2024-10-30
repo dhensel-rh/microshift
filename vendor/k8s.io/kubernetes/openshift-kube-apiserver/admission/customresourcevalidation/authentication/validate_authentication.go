@@ -1,6 +1,7 @@
 package authentication
 
 import (
+	"context"
 	"fmt"
 	"io"
 
@@ -47,7 +48,7 @@ func toAuthenticationV1(uncastObj runtime.Object) (*configv1.Authentication, fie
 
 type authenticationV1 struct{}
 
-func (authenticationV1) ValidateCreate(uncastObj runtime.Object) field.ErrorList {
+func (authenticationV1) ValidateCreate(_ context.Context, uncastObj runtime.Object) field.ErrorList {
 	obj, errs := toAuthenticationV1(uncastObj)
 	if len(errs) > 0 {
 		return errs
@@ -59,7 +60,7 @@ func (authenticationV1) ValidateCreate(uncastObj runtime.Object) field.ErrorList
 	return errs
 }
 
-func (authenticationV1) ValidateUpdate(uncastObj runtime.Object, uncastOldObj runtime.Object) field.ErrorList {
+func (authenticationV1) ValidateUpdate(_ context.Context, uncastObj runtime.Object, uncastOldObj runtime.Object) field.ErrorList {
 	obj, errs := toAuthenticationV1(uncastObj)
 	if len(errs) > 0 {
 		return errs
@@ -75,7 +76,7 @@ func (authenticationV1) ValidateUpdate(uncastObj runtime.Object, uncastOldObj ru
 	return errs
 }
 
-func (authenticationV1) ValidateStatusUpdate(uncastObj runtime.Object, uncastOldObj runtime.Object) field.ErrorList {
+func (authenticationV1) ValidateStatusUpdate(_ context.Context, uncastObj runtime.Object, uncastOldObj runtime.Object) field.ErrorList {
 	obj, errs := toAuthenticationV1(uncastObj)
 	if len(errs) > 0 {
 		return errs
@@ -103,27 +104,27 @@ func validateAuthenticationSpec(spec configv1.AuthenticationSpec) field.ErrorLis
 	errs := field.ErrorList{}
 	specField := field.NewPath("spec")
 
-	switch spec.Type {
-	case configv1.AuthenticationTypeNone, configv1.AuthenticationTypeIntegratedOAuth, "":
-	default:
-		errs = append(errs, field.NotSupported(specField.Child("type"),
-			spec.Type,
-			[]string{string(configv1.AuthenticationTypeNone), string(configv1.AuthenticationTypeIntegratedOAuth)},
-		))
+	if spec.WebhookTokenAuthenticator != nil {
+		switch spec.Type {
+		case configv1.AuthenticationTypeNone, configv1.AuthenticationTypeIntegratedOAuth, "":
+			// validate the secret name in WebhookTokenAuthenticator
+			errs = append(
+				errs,
+				crvalidation.ValidateSecretReference(
+					specField.Child("webhookTokenAuthenticator").Child("kubeConfig"),
+					spec.WebhookTokenAuthenticator.KubeConfig,
+					false,
+				)...,
+			)
+		default:
+			errs = append(errs, field.Invalid(specField.Child("webhookTokenAuthenticator"),
+				spec.WebhookTokenAuthenticator, fmt.Sprintf("this field cannot be set with the %q .spec.type", spec.Type),
+			))
+		}
+
 	}
 
 	errs = append(errs, crvalidation.ValidateConfigMapReference(specField.Child("oauthMetadata"), spec.OAuthMetadata, false)...)
-
-	// validate the secret names in WebhookTokenAuthenticators
-	for i, wh := range spec.WebhookTokenAuthenticators {
-		errs = append(
-			errs,
-			crvalidation.ValidateSecretReference(
-				specField.Child("webhookTokenAuthenticators").Index(i).Child("kubeConfig"),
-				wh.KubeConfig,
-				true,
-			)...)
-	}
 
 	return errs
 }

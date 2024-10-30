@@ -1,10 +1,13 @@
 *** Settings ***
 Documentation       Tests verifying microshift-cleanup-data script functionality
 
+Resource            ../../resources/common.resource
 Resource            ../../resources/systemd.resource
 Resource            ../../resources/ostree.resource
 Resource            ../../resources/ostree-health.resource
 Resource            ../../resources/microshift-config.resource
+Resource            ../../resources/microshift-network.resource
+Resource            ../../resources/kubeconfig.resource
 
 Suite Setup         Setup Suite
 
@@ -26,18 +29,27 @@ Verify Invalid Command Line
     ${rc}=    Run MicroShift Cleanup Data    --all    --ovn
     Should Not Be Equal As Integers    ${rc}    0
 
+    ${rc}=    Run MicroShift Cleanup Data    --all    --cert
+    Should Not Be Equal As Integers    ${rc}    0
+
+    ${rc}=    Run MicroShift Cleanup Data    --ovn    --cert
+    Should Not Be Equal As Integers    ${rc}    0
+
     ${rc}=    Run MicroShift Cleanup Data    --keep-images
     Should Not Be Equal As Integers    ${rc}    0
 
 Verify Full Cleanup Data
     [Documentation]    Verify full data clean scenarios
+    [Setup]    Run Keywords
+    ...    Setup Suite With Namespace
+    ...    Create Hello MicroShift Pod
 
     ${rc}=    Run MicroShift Cleanup Data    --all
     Should Be Equal As Integers    ${rc}    0
 
     MicroShift Processes Should Not Exist
-    SSHLibrary.Directory Should Not Exist    /var/lib/microshift
-    SSHLibrary.Directory Should Exist    /var/lib/microshift-backups
+    Verify Remote Directory Does Not Exist With Sudo    /var/lib/microshift
+    Verify Remote Directory Exists With Sudo    /var/lib/microshift-backups
 
     Crio Containers Should Not Exist
     Crio Pods Should Not Exist
@@ -47,18 +59,21 @@ Verify Full Cleanup Data
     OVN Data Should Not Exist
     OVN Internal Bridge Should Not Exist
 
-    [Teardown]
-    ...    Start MicroShift And Wait Until Ready
+    [Teardown]    Run Keywords
+    ...    Run MicroShift Test Case Teardown
 
 Verify Keep Images Cleanup Data
     [Documentation]    Verify keep images data clean scenario
+    [Setup]    Run Keywords
+    ...    Setup Suite With Namespace
+    ...    Create Hello MicroShift Pod
 
     ${rc}=    Run MicroShift Cleanup Data    --keep-images    --all
     Should Be Equal As Integers    ${rc}    0
 
     MicroShift Processes Should Not Exist
-    SSHLibrary.Directory Should Not Exist    /var/lib/microshift
-    SSHLibrary.Directory Should Exist    /var/lib/microshift-backups
+    Verify Remote Directory Does Not Exist With Sudo    /var/lib/microshift
+    Verify Remote Directory Exists With Sudo    /var/lib/microshift-backups
 
     Crio Containers Should Not Exist
     Crio Pods Should Not Exist
@@ -68,18 +83,22 @@ Verify Keep Images Cleanup Data
     OVN Data Should Not Exist
     OVN Internal Bridge Should Not Exist
 
-    [Teardown]
-    ...    Start MicroShift And Wait Until Ready
+    [Teardown]    Run Keywords
+    ...    Run MicroShift Test Case Teardown
 
 Verify OVN Cleanup Data
     [Documentation]    Verify OVN data cleanup scenario
+    [Setup]    Run Keywords
+    ...    Setup Suite With Namespace
+    ...    Create Hello MicroShift Pod
 
     ${rc}=    Run MicroShift Cleanup Data    --ovn
     Should Be Equal As Integers    ${rc}    0
 
     MicroShift Processes Should Not Exist
-    SSHLibrary.Directory Should Exist    /var/lib/microshift
-    SSHLibrary.Directory Should Exist    /var/lib/microshift-backups
+    Verify Remote Directory Exists With Sudo    /var/lib/microshift
+    Verify Remote Directory Exists With Sudo    /var/lib/microshift/certs
+    Verify Remote Directory Exists With Sudo    /var/lib/microshift-backups
 
     Crio Containers Should Not Exist
     Crio Pods Should Not Exist
@@ -89,8 +108,33 @@ Verify OVN Cleanup Data
     OVN Data Should Not Exist
     OVN Internal Bridge Should Not Exist
 
-    [Teardown]
-    ...    Start MicroShift And Wait Until Ready
+    [Teardown]    Run Keywords
+    ...    Run MicroShift Test Case Teardown
+
+Verify Cert Cleanup Data
+    [Documentation]    Verify certificate data cleanup scenario
+    [Setup]    Run Keywords
+    ...    Setup Suite With Namespace
+    ...    Create Hello MicroShift Pod
+
+    ${rc}=    Run MicroShift Cleanup Data    --cert
+    Should Be Equal As Integers    ${rc}    0
+
+    MicroShift Processes Should Not Exist
+    Verify Remote Directory Exists With Sudo    /var/lib/microshift
+    Verify Remote Directory Does Not Exist With Sudo    /var/lib/microshift/certs
+    Verify Remote Directory Exists With Sudo    /var/lib/microshift-backups
+
+    Crio Containers Should Not Exist
+    Crio Pods Should Not Exist
+    Crio Images Should Exist
+
+    OVN Processes Should Exist
+    OVN Data Should Exist
+    OVN Internal Bridge Should Exist
+
+    [Teardown]    Run Keywords
+    ...    Run MicroShift Test Case Teardown
 
 
 *** Keywords ***
@@ -101,8 +145,9 @@ Setup Suite
     Start MicroShift And Wait Until Ready
 
 Start MicroShift And Wait Until Ready
-    [Documentation]    Start the service and wait until full initialized
-    Systemctl    enable    --now microshift
+    [Documentation]    Start the service and wait until fully initialized
+    Systemctl    enable    microshift
+    Systemctl    start    microshift
     Restart Greenboot And Wait For Success
 
 Run MicroShift Cleanup Data
@@ -113,6 +158,14 @@ Run MicroShift Cleanup Data
     ...    echo 1 | sudo microshift-cleanup-data ${cmd} ${opt}
     ...    return_stdout=True    return_stderr=True    return_rc=True
     RETURN    ${rc}
+
+Run MicroShift Test Case Teardown
+    [Documentation]    Run the microshift-cleanup-data script and restart
+    ...    the service to ensure clean startup of other tests
+    # Try keeping the images to save on restart times
+    ${rc}=    Run MicroShift Cleanup Data    --keep-images    --all
+    Should Be Equal As Integers    ${rc}    0
+    Start MicroShift And Wait Until Ready
 
 MicroShift Processes Should Not Exist
     [Documentation]    Make sure that MicroShift and Etcd services are not running
@@ -167,14 +220,31 @@ OVN Processes Should Not Exist
     ...    return_stdout=True    return_stderr=True    return_rc=True
     Should Not Be Equal As Integers    ${rc}    0
 
+OVN Processes Should Exist
+    [Documentation]    Make sure that OVN processes are running
+
+    ${stdout}    ${stderr}    ${rc}=    Execute Command
+    ...    pidof conmon pause ovn-controller ovn-northd ovsdb-server
+    ...    return_stdout=True    return_stderr=True    return_rc=True
+    Should Be Equal As Integers    ${rc}    0
+
 OVN Data Should Not Exist
     [Documentation]    Make sure that OVN data files and directories are deleted
 
     # OVN data directories and files should be deleted
-    SSHLibrary.Directory Should Not Exist    /var/run/ovn
-    SSHLibrary.Directory Should Not Exist    /var/run/ovn-kubernetes
-    SSHLibrary.File Should Not Exist    /etc/cni/net.d/10-ovn-kubernetes.conf
-    SSHLibrary.File Should Not Exist    /opt/cni/bin/ovn-k8s-cni-overlay
+    Verify Remote Directory Does Not Exist With Sudo    /var/run/ovn
+    Verify Remote Directory Does Not Exist With Sudo    /var/run/ovn-kubernetes
+    Verify Remote File Does Not Exist With Sudo    /etc/cni/net.d/10-ovn-kubernetes.conf
+    Verify Remote File Does Not Exist With Sudo    /run/cni/bin/ovn-k8s-cni-overlay
+
+OVN Data Should Exist
+    [Documentation]    Make sure that OVN data files and directories exist
+
+    # OVN data directories and files should be deleted
+    Verify Remote Directory Exists With Sudo    /var/run/ovn
+    Verify Remote Directory Exists With Sudo    /var/run/ovn-kubernetes
+    Verify Remote File Exists With Sudo    /etc/cni/net.d/10-ovn-kubernetes.conf
+    Verify Remote File Exists With Sudo    /run/cni/bin/ovn-k8s-cni-overlay
 
 OVN Internal Bridge Should Not Exist
     [Documentation]    Make sure that OVN internal bridge devices do not exist
@@ -183,3 +253,11 @@ OVN Internal Bridge Should Not Exist
     ...    ovs-vsctl br-exists br-int
     ...    sudo=True    return_stdout=True    return_stderr=True    return_rc=True
     Should Not Be Equal As Integers    ${rc}    0
+
+OVN Internal Bridge Should Exist
+    [Documentation]    Make sure that OVN internal bridge devices exist
+
+    ${stdout}    ${stderr}    ${rc}=    Execute Command
+    ...    ovs-vsctl br-exists br-int
+    ...    sudo=True    return_stdout=True    return_stderr=True    return_rc=True
+    Should Be Equal As Integers    ${rc}    0

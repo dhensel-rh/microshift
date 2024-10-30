@@ -22,7 +22,7 @@ SSH_PASSWORD_OPTS="-o PubkeyAuthentication=no -o PreferredAuthentications=passwo
 # Show the IP address of the VM
 function get_ip {
     sudo virsh domifaddr "$1" \
-        | grep vnet \
+        | grep ipv \
         | awk '{print $4}' \
         | cut -f1 -d/
 }
@@ -43,41 +43,27 @@ function get_base_isofile {
 
     case ${rhel_version} in
         8)
-            echo "rhel-8.7-$(uname -m)-dvd.iso"
+            echo "rhel-8.10-$(uname -m)-dvd.iso"
             ;;
         8.*)
             echo "rhel-${rhel_version}-$(uname -m)-dvd.iso"
             ;;
         9)
-            echo "rhel-9.2-$(uname -m)-dvd.iso"
+            echo "rhel-9.4-$(uname -m)-dvd.iso"
             ;;
         9.*)
             echo "rhel-${rhel_version}-$(uname -m)-dvd.iso"
             ;;
         *)
-            echo "unknown RHEL version ${rhel_version}" 1>&2
+            echo "Unknown RHEL version ${rhel_version}" 1>&2
             exit 1
     esac
 }
 
 function action_config() {
-    local tries=0
-    local failed=true
-    local deps="libvirt virt-manager virt-install virt-viewer libvirt-client qemu-kvm qemu-img sshpass"
-
-    set +e  # retry because we see errors caching different RPMs in CI
-    while [ ${tries} -lt 5 ]; do
-        # shellcheck disable=SC2086
-        if sudo dnf install -y ${deps}; then
-            failed=false
-            break
-        fi
-        ((tries+=1))
-    done
-    if ${failed}; then
-        exit 1
-    fi
-    set -e
+    local -r deps="libvirt virt-manager virt-install virt-viewer libvirt-client qemu-kvm qemu-img sshpass wget"
+    
+    "${SCRIPTDIR}/../dnf_retry.sh" "install" "${deps}"
 
     if [ "$(systemctl is-active libvirtd.socket)" != "active" ] ; then
         echo "Enabling libvirtd"
@@ -85,6 +71,13 @@ function action_config() {
     fi
     # Necessary to allow remote connections in the virt-viewer application
     sudo usermod -a -G libvirt "$(whoami)"
+
+    binary="yq_linux_amd64"
+    if [ "$(arch)" == "aarch64" ]; then
+        binary="yq_linux_arm64"
+    fi
+
+    sudo wget https://github.com/mikefarah/yq/releases/latest/download/"${binary}" -O /usr/bin/yq && sudo chmod +x /usr/bin/yq
 }
 
 # Create the VM, if it does not exist
@@ -94,7 +87,7 @@ function action_create {
     export VMDISKDIR="${MICROSHIFT_VMDISKDIR}"
     export NCPUS="${NCPUS:-4}"
     export RAMSIZE="${RAMSIZE:-8}"
-    export DISKSIZE="${DISKSIZE:-70}"
+    export DISKSIZE="${DISKSIZE:-100}"
     export SWAPSIZE="${SWAPSIZE:-8}"
     export DATAVOLSIZE="${DATAVOLSIZE:-2}"
     if [ -z "${ISOFILE}" ]; then
@@ -183,7 +176,7 @@ function action_delete {
     fi
 
     sudo virsh destroy "${VMNAME}"
-    sudo virsh undefine "${VMNAME}"
+    sudo virsh undefine --nvram "${VMNAME}"
 
     # FIXME: The volume pool here may not be standard. How do we
     # figure out what it should be?

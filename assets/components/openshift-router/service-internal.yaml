@@ -18,8 +18,10 @@ spec:
       port: 1936
       protocol: TCP
       targetPort: metrics
+  sessionAffinity: None
   selector:
     ingresscontroller.operator.openshift.io/deployment-ingresscontroller: default
+  ipFamilyPolicy: '{{.IPFamily}}'
 metadata:
   labels:
     ingresscontroller.operator.openshift.io/owning-ingresscontroller: default

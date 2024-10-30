@@ -8,6 +8,7 @@ Resource            ../../resources/common.resource
 Resource            ../../resources/kubeconfig.resource
 Resource            ../../resources/oc.resource
 Resource            ../../resources/microshift-config.resource
+Resource            ../../resources/ostree-health.resource
 
 Suite Setup         Test Suite Setup
 Suite Teardown      Test Suite Teardown
@@ -41,13 +42,14 @@ Snapshotter Smoke Test
 Test Suite Setup
     [Documentation]    Setup test namespace, patch the lvmd for thin-volume support, and restart microshift for
     ...    it to take effect
-    Setup Suite With Namespace
+    Setup Suite
     Create Thin Storage Pool
     Save Lvmd Config
     ${config}=    Extend Lvmd Config
     Upload Lvmd Config    ${config}
     Oc Apply    -f ${STORAGE_CLASS} -f ${SNAPSHOT_CLASS}
     Restart Microshift
+    Restart Greenboot And Wait For Success
 
 Test Suite Teardown
     [Documentation]    Clean up test suite resources
@@ -55,10 +57,13 @@ Test Suite Teardown
     Restore Lvmd Config
     Delete Thin Storage Pool
     Restart Microshift
-    Teardown Suite With Namespace
+    Restart Greenboot And Wait For Success
+    Teardown Suite
 
 Test Case Setup
     [Documentation]    Prepare the cluster-level APIs and a data-volume with some simple text
+    ${ns}=    Create Unique Namespace
+    Set Test Variable    \${NAMESPACE}    ${ns}
     Oc Apply    -k ${SOURCE_KUSTOMIZE} -n ${NAMESPACE}
     Named Pod Should Be Ready    ${POD_NAME_STATIC}
     Write To Volume    ${POD_NAME_STATIC}    ${TEST_DATA}
@@ -75,6 +80,7 @@ Test Case Teardown
     Oc Delete    pvc snapshot-restore -n ${NAMESPACE}
     Named PVC Should Be Deleted    test-claim-thin
     Named PVC Should Be Deleted    snapshot-restore
+    Remove Namespace    ${NAMESPACE}
 
 Write To Volume
     [Documentation]    Write some simple text to the data volume

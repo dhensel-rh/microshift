@@ -16,6 +16,10 @@ name = "microshift-greenboot"
 version = "REPLACE_MICROSHIFT_VERSION"
 
 [[packages]]
+name = "microshift-olm"
+version = "REPLACE_MICROSHIFT_VERSION"
+
+[[packages]]
 name = "microshift-networking"
 version = "REPLACE_MICROSHIFT_VERSION"
 
@@ -25,6 +29,10 @@ version = "REPLACE_MICROSHIFT_VERSION"
 
 [[packages]]
 name = "microshift-release-info"
+version = "REPLACE_MICROSHIFT_VERSION"
+
+[[packages]]
+name = "microshift-multus"
 version = "REPLACE_MICROSHIFT_VERSION"
 
 [[packages]]
@@ -51,6 +59,10 @@ version = "*"
 
 [[packages]]
 name = "strace"
+version = "*"
+
+[[packages]]
+name = "iproute-tc"
 version = "*"
 
 # customizations

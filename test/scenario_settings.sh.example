@@ -1,12 +1,5 @@
 #!/bin/bash
 
-# Set the PUBLIC_IP to the IP address used to access the hypervisor.
-# Enable this setting to connect to VMs via the specified IP using
-# port-forwarded connections. Otherwise, IP addresses assigned by
-# libvirt are used for accessing VMs.
-# shellcheck disable=SC2034
-#PUBLIC_IP=1.2.3.4
-
 # Set SSH_PUBLIC_KEY to the filename of the ssh key to be used to
 # access the VMs created.
 # shellcheck disable=SC2034
@@ -24,3 +17,9 @@ SSH_PUBLIC_KEY=${SSH_PUBLIC_KEY:-${HOME}/.ssh/id_rsa.pub}
 # local developer settings where cockpit can be used to login to the
 # host. Set to `true` to enable. Defaults to `false`.
 #VNC_CONSOLE=true
+
+# SUBSCRIPTION_MANAGER_PLUGIN should be the full path to a bash script
+# that can be sourced to provide a function called
+# `subscription_manager_register`. See
+# `load_subscription_manager_plugin` in scenario.sh for details.
+# SUBSCRIPTION_MANAGER_PLUGIN="${SCRIPTDIR}/subscription_manager_register.sh"

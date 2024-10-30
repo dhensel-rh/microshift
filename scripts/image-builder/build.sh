@@ -139,10 +139,10 @@ build_image() {
         sudo podman run -d --name="${parent_blueprint}-server" -p 8085:8080 "localhost/${parent_blueprint}:${parent_version}"
 
         title "Building ${image_type} for ${blueprint} v${version}, parent ${parent_blueprint} v${parent_version}"
-        buildid=$(sudo composer-cli compose start-ostree --ref "rhel/${OSVERSION}/${BUILD_ARCH}/edge" --url http://localhost:8085/repo/ "${blueprint}" "${image_type}" | awk '{print $2}')
+        buildid=$(sudo composer-cli compose start-ostree --ref "rhel/${OSVERSION}/${BUILD_ARCH}/edge" --url http://localhost:8085/repo/ "${blueprint}" "${image_type}" | awk '/Compose/{print $2}')
     else
         title "Building ${image_type} for ${blueprint} v${version}"
-        buildid=$(sudo composer-cli compose start-ostree --ref "rhel/${OSVERSION}/${BUILD_ARCH}/edge" "${blueprint}" "${image_type}" | awk '{print $2}')
+        buildid=$(sudo composer-cli compose start-ostree --ref "rhel/${OSVERSION}/${BUILD_ARCH}/edge" "${blueprint}" "${image_type}" | awk '/Compose/{print $2}')
     fi
 
     waitfor_image "${buildid}"
@@ -347,7 +347,19 @@ if [ -n "${CUSTOM_RPM_FILES}" ] ; then
 fi
 
 title "Loading package sources"
-PACKAGE_SOURCES="microshift-local rhocp-4.13 fast-datapath"
+
+RHOCP=$("${ROOTDIR}/scripts/get-latest-rhocp-repo.sh")
+if [[ "${RHOCP}" =~ ^[0-9]{2} ]]; then
+    OCP_MINOR="${RHOCP}"
+    RHOCP_URL="https://cdn.redhat.com/content/dist/layered/rhel9/${BUILD_ARCH}/rhocp/4.${OCP_MINOR}/os"
+    RHOCP_GPG_RHSM="true"
+elif [[ "${RHOCP}" =~ ^http ]]; then
+    RHOCP_URL=$(echo "${RHOCP}" | cut -d, -f1)
+    OCP_MINOR=$(echo "${RHOCP}" | cut -d, -f2)
+    RHOCP_GPG_RHSM="false"
+fi
+
+PACKAGE_SOURCES="microshift-local rhocp fast-datapath"
 if [ -n "${CUSTOM_RPM_FILES}" ] ; then
     PACKAGE_SOURCES+=" custom-rpms"
 fi
@@ -355,6 +367,9 @@ fi
 for f in ${PACKAGE_SOURCES} ; do
     sed -e "s;REPLACE_IMAGE_BUILDER_DIR;${BUILDDIR};g" \
         -e "s;REPLACE_BUILD_ARCH;${BUILD_ARCH};g" \
+        -e "s;REPLACE_OCP_MINOR;${OCP_MINOR};g" \
+        -e "s;REPLACE_RHOCP_URL;${RHOCP_URL};g" \
+        -e "s;REPLACE_RHOCP_GPG_RHSM;${RHOCP_GPG_RHSM};g" \
         "${SCRIPTDIR}/config/${f}.toml.template" \
         > ${f}.toml
     sudo composer-cli sources delete ${f} 2>/dev/null || true

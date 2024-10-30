@@ -145,11 +145,15 @@ func (c *Controller) Stop() {
 // Run periodically updates the kubernetes service
 func (c *Controller) Run(ch <-chan struct{}) {
 	// wait until process is ready
-	wait.PollImmediateUntil(100*time.Millisecond, func() (bool, error) {
+	ctx := wait.ContextForChannel(ch)
+	err := wait.PollUntilContextCancel(ctx, 100*time.Millisecond, true, func(context.Context) (bool, error) {
 		var code int
 		c.client.CoreV1().RESTClient().Get().AbsPath("/readyz").Do(context.TODO()).StatusCode(&code)
 		return code == http.StatusOK, nil
-	}, ch)
+	})
+	if err != nil {
+		return
+	}
 
 	KubeAPIServerEmitEventFn(corev1.EventTypeWarning, "KubeAPIReadyz", "readyz=true")
 
@@ -186,7 +190,7 @@ func createPortAndServiceSpec(servicePort int, targetServicePort int, nodePort i
 		Protocol:   corev1.ProtocolTCP,
 		Port:       int32(servicePort),
 		Name:       servicePortName,
-		TargetPort: intstr.FromInt(targetServicePort),
+		TargetPort: intstr.FromInt32(int32(targetServicePort)),
 	}}
 	serviceType := corev1.ServiceTypeClusterIP
 	if nodePort > 0 {

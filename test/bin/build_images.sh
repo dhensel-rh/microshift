@@ -14,10 +14,15 @@ shopt -s nullglob
 SCRIPTDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 # shellcheck source=test/bin/common.sh
 source "${SCRIPTDIR}/common.sh"
-# shellcheck source=test/bin/get_rel_version_repo.sh
-source "${SCRIPTDIR}/get_rel_version_repo.sh"
+# shellcheck source=test/bin/common_versions.sh
+source "${SCRIPTDIR}/common_versions.sh"
+
+SKIP_LOG_COLLECTION=${SKIP_LOG_COLLECTION:-false}
 
 osbuild_logs() {
+    if ${SKIP_LOG_COLLECTION}; then
+        return
+    fi
     workers_services=$(sudo systemctl list-units | awk '/osbuild-worker@/ {print $1} /osbuild-composer\.service/ {print $1}')
     for service in ${workers_services}; do
         # shellcheck disable=SC2024  # redirect and sudo
@@ -25,25 +30,37 @@ osbuild_logs() {
     done
 }
 
+extract_container_images() {
+    local -r version=$1    # full version
+    local -r repo_spec=$2  # repo name, path, or URL
+    local -r outfile=$3    # destination file
+
+    echo "Extracting images from ${version}"
+    mkdir -p "${IMAGEDIR}/release-info-rpms"
+    pushd "${IMAGEDIR}/release-info-rpms"
+    dnf_options=""
+    local -r repo_name="$(basename "${repo_spec}")"
+    if [[ "${repo_spec}" =~ ^https://.* ]]; then
+        # If the spec is a URL, set up the arguments to point to that location.
+        dnf_options="--repofrompath ${repo_name},${repo_spec} --repo ${repo_name}"
+    elif [[ "${repo_spec}" =~ ^/.* ]]; then
+        # If the spec is a path, set up the arguments to point to that path.
+        dnf_options="--repofrompath ${repo_name},${repo_spec} --repo ${repo_name}"
+    elif [[ -n ${repo_spec} ]]; then
+        # If the spec is a name, assume it is already known to the
+        # system through normal configuration. The repo does not need
+        # to be enabled in order for dnf to download a package from
+        # it.
+        dnf_options="--repo ${repo_spec}"
+    fi
+    # shellcheck disable=SC2086  # double quotes
+    sudo dnf download ${dnf_options} microshift-release-info-"${version}"
+    get_container_images "${version}" "${IMAGEDIR}/release-info-rpms" | sed 's/,/\n/g' >> "${outfile}"
+    sudo rm -f microshift-release-info-*.rpm
+    popd
+}
+
 configure_package_sources() {
-    ## TEMPLATE VARIABLES
-    export UNAME_M                 # defined in common.sh
-    export LOCAL_REPO              # defined in common.sh
-    export NEXT_REPO               # defined in common.sh
-    export BASE_REPO               # defined in common.sh
-    export YPLUS2_REPO             # defined in common.sh
-    export CURRENT_RELEASE_REPO
-    export PREVIOUS_RELEASE_REPO
-
-    export SOURCE_VERSION
-    export FAKE_NEXT_MINOR_VERSION
-    export FAKE_YPLUS2_MINOR_VERSION
-    export MINOR_VERSION
-    export PREVIOUS_MINOR_VERSION
-    export SOURCE_VERSION_BASE
-    export CURRENT_RELEASE_VERSION
-    export PREVIOUS_RELEASE_VERSION
-
     # Add our sources. It is OK to run these steps repeatedly, if the
     # details change they are updated in the service.
     title "Expanding package source templates to ${IMAGEDIR}/package-sources"
@@ -78,9 +95,10 @@ configure_package_sources() {
 # and returns them as comma-separated list.
 get_container_images() {
     local -r version="${1}"
+    local -r path="${2}"
 
     # Find the microshift-release-info RPM with the specified version
-    local -r release_info_rpm=$(find "${IMAGEDIR}/rpm-repos" -name "microshift-release-info-${version}*.rpm" | sort | tail -1)
+    local -r release_info_rpm=$(find "${path}" -name "microshift-release-info-${version}*.rpm" | sort | tail -1)
     if [ -z "${release_info_rpm}" ] ; then
         echo "Error: missing microshift-release-info RPM for the '${version}' version"
         exit 1
@@ -113,7 +131,14 @@ get_image_parent() {
     base=$(basename "${blueprint_filename}" .toml)
     if [[ "${base}" =~ '-' ]]; then
         base="${base//-*/}"
-        get_blueprint_name "${IMAGEDIR}/blueprints/${base}.toml"
+
+        local name
+        name=$(find "${TESTDIR}/image-blueprints" -name "${base}.toml")
+        if [ -n "${name}" ] ; then
+            get_blueprint_name "${name}"
+        else
+            echo ""
+        fi
     else
         echo ""
     fi
@@ -160,17 +185,38 @@ record_junit() {
 <testcase classname="${group} ${image_reference}" name="${step}">
 EOF
 
-    if [ "${results}" != "OK" ]; then
+    case "${results}" in
+        OK)
+        ;;
+        SKIP*)
         cat - >>"${outputfile}" <<EOF
-<failure message="${results}" type="createImageFailure">
-</failure>
+<skipped message="${results}" type="${step}-skipped" />
 EOF
-    fi
+        ;;
+        FAIL*)
+        cat - >>"${outputfile}" <<EOF
+<failure message="${results}" type="${step}-failure" />
+EOF
+    esac
 
     cat - >>"${outputfile}" <<EOF
 </testcase>
 EOF
 
+}
+
+should_skip() {
+    local -r blueprint="${1}"
+
+    if "${FORCE_REBUILD}"; then
+        echo "Forcing all rebuilds"
+        return 1
+    fi
+    if [[ "${blueprint}" =~ source ]] && "${FORCE_SOURCE}"; then
+        echo "Forcing source rebuild"
+        return 1
+    fi
+    return 0
 }
 
 # Process a set of blueprint templates to create edge commit images
@@ -190,14 +236,20 @@ do_group() {
     local blueprint_file
     local build_name
     local buildid
-    local buildid_list=""
+    local buildid_list=()
+    local download_opts=()
+    local builds_to_get=""
     local parent
     local parent_args
     local template
     local template_list
 
-    SOURCE_IMAGES="$(get_container_images "${SOURCE_VERSION}")"
+    SOURCE_IMAGES="$(get_container_images "${SOURCE_VERSION}" "${IMAGEDIR}/rpm-repos")"
     export SOURCE_IMAGES
+
+    echo "Existing images:"
+    ls "${VM_DISK_BASEDIR}"/*.iso || echo "No ISO files in ${VM_DISK_BASEDIR}"
+    ostree summary --view --repo="${IMAGEDIR}/repo" || echo "Could not get image list from ${IMAGEDIR}/repo"
 
     # Upload the blueprint definitions
     if [ -n "${template_arg}" ]; then
@@ -210,6 +262,8 @@ do_group() {
             template_list=$(echo "${groupdir}"/*source*.toml)
         fi
     fi
+
+    local failed_depsolve=()
     for template in ${template_list}; do
         echo
         echo "Blueprint ${template}"
@@ -228,11 +282,22 @@ do_group() {
         ${GOMPLATE} --file "${template}" >"${blueprint_file}"
         if [[ "$(wc -l "${blueprint_file}" | cut -d ' ' -f1)" -eq 0 ]]; then
             echo "WARNING: Templating '${template}' resulted in empty file! - SKIPPING"
+            record_junit "${groupdir}" "${template}" "compose" "SKIPPED"
             continue
         fi
         record_junit "${groupdir}" "${template}" "render" "OK"
 
         blueprint=$(get_blueprint_name "${blueprint_file}")
+
+        # Check if the image for this blueprint already exists, in
+        # case it was downloaded from the cache.
+        if ostree summary --view --repo="${IMAGEDIR}/repo" | grep -q " ${blueprint}\$"; then
+            echo "Found ${blueprint} in existing images"
+            if should_skip "${blueprint}"; then
+                record_junit "${groupdir}" "${template}" "compose" "SKIPPED"
+                continue
+            fi
+        fi
 
         if sudo composer-cli blueprints list | grep -q "^${blueprint}$"; then
             echo "Removing existing definition of ${blueprint}"
@@ -249,6 +314,16 @@ do_group() {
             record_junit "${groupdir}" "${blueprint}" "depsolve" "OK"
         else
             record_junit "${groupdir}" "${blueprint}" "depsolve" "FAILED"
+            # Log an error and proceed with the build by skipping the failed blueprint.
+            # The error will be reported in the end of the procedure.
+            echo "ERROR: Failed to solve dependences for '${blueprint}' blueprint - skipping"
+            failed_depsolve+=("${blueprint}")
+            continue
+        fi
+
+        if ${COMPOSER_DRY_RUN} ; then
+            echo "Skipping the composer start operation"
+            continue
         fi
 
         parent_args=""
@@ -258,47 +333,147 @@ do_group() {
         fi
         echo "Building edge-commit from ${blueprint} ${parent_args}"
         # shellcheck disable=SC2086  # quote to avoid glob expansion
-        buildid=$(sudo composer-cli compose start-ostree \
-                       ${parent_args} \
-                       --ref "${blueprint}" \
-                       "${blueprint}" \
-                       edge-commit \
-                      | awk '{print $2}')
+        build_cmd="sudo composer-cli compose start-ostree ${parent_args} --ref ${blueprint} ${blueprint} edge-commit"
+        for _ in $(seq 3); do
+            set +e
+            build_cmd_output=$(${build_cmd})
+            rc=$?
+            set -e
+            if [[ "${rc}" -eq 0 ]]; then
+                buildid=$(echo "${build_cmd_output}" | awk '/^Compose/ {print $2}')
+                break
+            fi
+            sleep 15
+        done
+
+        if [[ "${rc}" -ne 0 ]]; then
+            echo "Command failed consistently: ${build_cmd}"
+            exit 1
+        fi
+
         echo "Build ID ${buildid}"
         # Record a "build name" to be used as part of the unique
         # filename for the log we download next.
         echo "${blueprint}-edge-commit" > "${IMAGEDIR}/builds/${buildid}.build"
-        buildid_list="${buildid_list} ${buildid}"
+        buildid_list+=("${buildid},${build_cmd}")
     done
 
-    if ${BUILD_INSTALLER}; then
+    if ${BUILD_INSTALLER} && ! ${COMPOSER_DRY_RUN}; then
         for image_installer in "${groupdir}"/*.image-installer; do
+            # If a template arg was given, only build the image installer for the
+            # matching template.
+            if [ -n "${template_arg}" ]; then
+                installer_file=$(basename "${image_installer}")
+                template_file=$(basename "${template_arg}")
+                if [ "${installer_file%.image-installer}" != "${template_file%.toml}" ]; then
+                    continue
+                fi
+            fi
             blueprint=$("${GOMPLATE}" --file "${image_installer}")
+            local expected_iso_file="${VM_DISK_BASEDIR}/${blueprint}.iso"
+            if [ -f "${expected_iso_file}" ]; then
+                echo "${expected_iso_file} already exists"
+                if should_skip "${blueprint}"; then
+                    record_junit "${groupdir}" "${image_installer}" "compose" "SKIPPED"
+                    continue
+                fi
+            fi
             echo "Building image-installer from ${blueprint}"
-            buildid=$(sudo composer-cli compose start \
-                           "${blueprint}" \
-                           image-installer \
-                          | awk '{print $2}')
+            build_cmd="sudo composer-cli compose start ${blueprint} image-installer"
+            buildid=$(${build_cmd} | awk '{print $2}')
             echo "Build ID ${buildid}"
             # Record a "build name" to be used as part of the unique
             # filename for the log we download next.
             echo "${blueprint}-image-installer" > "${IMAGEDIR}/builds/${buildid}.build"
-            buildid_list="${buildid_list} ${buildid}"
+            buildid_list+=("${buildid},${build_cmd}")
         done
     fi
 
-    if [ -n "${buildid_list}" ]; then
+    if ${BUILD_INSTALLER} && ! ${COMPOSER_DRY_RUN}; then
+        for download_file in "${groupdir}"/*.image-fetcher; do
+            local download_url
+            download_url=$("${GOMPLATE}" --file "${download_file}")
+            blueprint="$(basename -s .image-fetcher "${download_file}")"
+            local expected_iso_file="${VM_DISK_BASEDIR}/${blueprint}.iso"
+            if [ -f "${expected_iso_file}" ]; then
+                echo "${expected_iso_file} already exists"
+                if should_skip "${blueprint}"; then
+                    record_junit "${groupdir}" "${download_file}" "download" "SKIPPED"
+                    continue
+                fi
+            fi
+
+            echo "Adding image-fetcher for ${download_file}"
+            download_opts+=("${expected_iso_file} ${download_url}")
+        done
+    fi
+
+    # Run image-fetcher while osbuilder is running in background
+    if [ ${#download_opts[@]} -ne 0 ]; then
+        local -r dload_tmp="download.part"
+        local -r dload_res="${IMAGEDIR}/image_fetcher_result.json"
+        local -r dload_job="${IMAGEDIR}/image_fetcher_jobs.txt"
+
+        local fetch_ok=true
+        local progress=""
+        if [ -t 0 ]; then
+            progress="--progress"
+        fi
+        # Download the files under temporary names with 30s network timeout
+        # and retries. Note that download options are quoted per each job,
+        # resuting in one option per job in the download_opts array.
+        echo "Waiting for image-fetcher to complete..."
+        if parallel \
+            ${progress} \
+            --colsep ' ' \
+            --results "${dload_res}" \
+            --joblog "${dload_job}" \
+            --jobs ${#download_opts[@]} \
+            aria2c --max-connection-per-server=4 --split=4 --max-tries=3 --timeout=30 \
+                --continue --dir=/ -o "{1}.${dload_tmp}" "{2}" ::: "${download_opts[@]}" ; then
+            # On successful download, rename the files to their original names
+            for dload_file in "${VM_DISK_BASEDIR}"/*."${dload_tmp}" ; do
+                local forig
+                forig="$(basename -s ".${dload_tmp}" "${dload_file}")"
+                mv "${dload_file}" "${VM_DISK_BASEDIR}/${forig}"
+            done
+        else
+            fetch_ok=false
+        fi
+
+        # Show the summary of the output of the parallel jobs.
+        cat "${dload_job}"
+        if [ -f "${dload_res}" ] ; then
+            jq < "${dload_res}"
+        else
+            echo "The image-fetcher results file does not exist"
+            fetch_ok=false
+        fi
+
+        if ! ${fetch_ok} ; then
+            echo "ERROR: The image-fetcher failed to complete successfully"
+            exit 1
+        fi
+    fi
+    if [ ${#buildid_list[@]} -ne 0 ]; then
         echo "Waiting for builds to complete..."
-        # shellcheck disable=SC2086  # pass command arguments quotes to allow word splitting
-        time "${SCRIPTDIR}/wait_images.py" ${buildid_list}
+        # wait_images.py returns possibly updated list of builds that must be handled
+        # "update" means replacing initial build ID with retry build ID
+        builds_to_get=$(time "${SCRIPTDIR}/wait_images.py" "${buildid_list[@]}")
+    fi
+
+    builds_to_get_num="$(echo "${builds_to_get}" | awk -F' ' '{print NF}')"
+    if [ "${#buildid_list[@]}" -ne "${builds_to_get_num}" ]; then
+        echo "wait_images.py returned unexpected amount of build IDs"
+        return 1
     fi
 
     echo "Downloading build logs, metadata, and image"
     cd "${IMAGEDIR}/builds"
 
-    failed_builds=()
+    local failed_builds=()
     # shellcheck disable=SC2231  # allow glob expansion without quotes in for loop
-    for buildid in ${buildid_list}; do
+    for buildid in ${builds_to_get}; do
         # shellcheck disable=SC2086  # pass glob args without quotes
         rm -f ${buildid}-*.tar
 
@@ -318,7 +493,8 @@ do_group() {
         if [ "${status}" != "FINISHED" ]; then
             failed_builds+=("${buildid}")
             record_junit "${groupdir}" "${build_name}" "compose" "${status}"
-            sudo composer-cli compose info "${buildid}"
+            sudo composer-cli compose info --json "${buildid}"
+            sudo composer-cli compose log "${buildid}"
             continue
         fi
 
@@ -343,10 +519,16 @@ do_group() {
         record_junit "${groupdir}" "${build_name}" "compose" "OK"
     done
 
-    # Exit the function on build errors
-    if [ ${#failed_builds[@]} -ne 0 ] ; then
-        echo "Error: check the failed build jobs"
-        echo "${failed_builds[@]}"
+    # Exit the function on dependency or build errors
+    if [ ${#failed_builds[@]} -ne 0 ] || [ ${#failed_depsolve[@]} -ne 0 ] ; then
+        if [ ${#failed_depsolve[@]} -ne 0 ] ; then
+            echo "Error: check the failed blueprints dependency"
+            echo "${failed_depsolve[@]}"
+        fi
+        if [ ${#failed_builds[@]} -ne 0 ] ; then
+            echo "Error: check the failed build jobs"
+            echo "${failed_builds[@]}"
+        fi
         return 1
     fi
 
@@ -365,6 +547,7 @@ do_group() {
             record_junit "${groupdir}" "${alias_name}" "alias" "OK"
         else
             record_junit "${groupdir}" "${alias_name}" "alias" "FAILED"
+            return 1
         fi
     done
 
@@ -375,8 +558,23 @@ do_group() {
 }
 
 usage() {
+    if [ $# -gt 0 ] ; then
+        echo "ERROR: $*"
+        echo
+    fi
+
     cat - <<EOF
-build_images.sh [-Is] [-g group-dir] [-t template]
+build_images.sh [-iIsdf] [-l layer-dir | -g group-dir] [-t template]
+
+  -d      Dry run by skipping the composer start commands.
+
+  -E      Do not extract container images.
+
+  -f      Force rebuilding images that already exist.
+
+  -g DIR  Build only one group (cannot be used with -l or -t).
+          The DIR should be the path to the group to build.
+          Implies -l based on the path.
 
   -h      Show this help
 
@@ -384,23 +582,46 @@ build_images.sh [-Is] [-g group-dir] [-t template]
 
   -I      Do not build the installer image(s).
 
-  -s      Only build source images (implies -I).
+  -l DIR  Build only one layer (cannot be used with -g or -t).
+          The DIR should be the path to the layer to build.
 
-  -g DIR  Build only one group.
+  -s      Only build source images (implies -I). Ignores cached images.
 
-  -t FILE Build only one template. The FILE should be the path to
-          the template to build. Implies -g based on filename.
+  -S      Skip collecting builder logs when there is a failure. Speeds
+          up local development cycle.
+
+  -t FILE Build only one template (cannot be used with -l or -g).
+          The FILE should be the path to the template to build.
+          Implies -f along with -l and -g based on the filename.
 
 EOF
 }
 
 BUILD_INSTALLER=true
 ONLY_SOURCE=false
+COMPOSER_DRY_RUN=false
+LAYER=""
 GROUP=""
 TEMPLATE=""
+FORCE_REBUILD=false
+FORCE_SOURCE=false
+EXTRACT_CONTAINER_IMAGES=true
 
-while getopts "iIg:st:h" opt; do
+selCount=0
+while getopts "dEfg:hiIl:sSt:" opt; do
     case "${opt}" in
+        d)
+            COMPOSER_DRY_RUN=true
+            ;;
+        E)  EXTRACT_CONTAINER_IMAGES=false
+            ;;
+        f)
+            FORCE_REBUILD=true
+            ;;
+        g)
+            GROUP="$(realpath "${OPTARG}")"
+            selCount=$((selCount+1))
+            ;;
         h)
             usage
             exit 0
@@ -411,25 +632,35 @@ while getopts "iIg:st:h" opt; do
         I)
             BUILD_INSTALLER=false
             ;;
-        g)
-            GROUP="${OPTARG}"
+        l)
+            LAYER="$(realpath "${OPTARG}")"
+            selCount=$((selCount+1))
             ;;
         s)
             BUILD_INSTALLER=false
             ONLY_SOURCE=true
+            FORCE_SOURCE=true
+            ;;
+        S)
+            SKIP_LOG_COLLECTION=true
             ;;
         t)
             TEMPLATE="${OPTARG}"
-            GROUP="$(basename "$(dirname "$(realpath "${OPTARG}")")")"
+            GROUP="$(dirname "$(realpath "${OPTARG}")")"
+            selCount=$((selCount+1))
+            FORCE_REBUILD=true
             ;;
         *)
-            echo "ERROR: Unknown option ${opt}"
-            echo
-            usage
+            usage "ERROR: Unknown option ${opt}"
             exit 1
             ;;
     esac
 done
+
+if [ ${selCount} -gt 1 ] ; then
+    usage "The layer, group and template options are mutually exclusive"
+    exit 1
+fi
 
 if [ ! -f "${GOMPLATE}" ]; then
     "${ROOTDIR}/scripts/fetch_tools.sh" gomplate
@@ -438,8 +669,7 @@ fi
 # Determine the version of the RPM in the local repo so we can use it
 # in the blueprint templates.
 if [ ! -d "${LOCAL_REPO}" ]; then
-    error "Run ${SCRIPTDIR}/create_local_repo.sh before building images."
-    exit 1
+    "${TESTDIR}/bin/build_rpms.sh"
 fi
 release_info_rpm=$(find "${LOCAL_REPO}" -name 'microshift-release-info-*.rpm' | sort | tail -n 1)
 if [ -z "${release_info_rpm}" ]; then
@@ -451,20 +681,11 @@ if [ -z "${release_info_rpm_base}" ]; then
     error "Failed to find microshift-release-info RPM in ${BASE_REPO}"
     exit 1
 fi
-SOURCE_VERSION=$(rpm -q --queryformat '%{version}' "${release_info_rpm}")
-MINOR_VERSION=$(echo "${SOURCE_VERSION}" | cut -f2 -d.)
-PREVIOUS_MINOR_VERSION=$(( "${MINOR_VERSION}" - 1 ))
-FAKE_NEXT_MINOR_VERSION=$(( "${MINOR_VERSION}" + 1 ))
-FAKE_YPLUS2_MINOR_VERSION=$(( "${MINOR_VERSION}" + 2 ))
-SOURCE_VERSION_BASE=$(rpm -q --queryformat '%{version}' "${release_info_rpm_base}")
 
-current_version_repo=$(get_rel_version_repo "${MINOR_VERSION}")
-CURRENT_RELEASE_VERSION=$(echo "${current_version_repo}" | cut -d, -f1)
-CURRENT_RELEASE_REPO=$(echo "${current_version_repo}" | cut -d, -f2)
-
-previous_version_repo=$(get_rel_version_repo "${PREVIOUS_MINOR_VERSION}")
-PREVIOUS_RELEASE_VERSION=$(echo "${previous_version_repo}" | cut -d, -f1)
-PREVIOUS_RELEASE_REPO=$(echo "${previous_version_repo}" | cut -d, -f2)
+SOURCE_VERSION=$(rpm -q --queryformat '%{version}-%{release}' "${release_info_rpm}")
+SOURCE_VERSION_BASE=$(rpm -q --queryformat '%{version}-%{release}' "${release_info_rpm_base}")
+export SOURCE_VERSION
+export SOURCE_VERSION_BASE
 
 mkdir -p "${IMAGEDIR}"
 LOGDIR="${IMAGEDIR}/build-logs"
@@ -475,12 +696,31 @@ mkdir -p "${VM_DISK_BASEDIR}"
 
 configure_package_sources
 
+# Prepare container lists for mirroring registries.
+rm -f "${CONTAINER_LIST}"
+if ${EXTRACT_CONTAINER_IMAGES}; then
+    extract_container_images "${SOURCE_VERSION}" "${LOCAL_REPO}" "${CONTAINER_LIST}"
+    # The following images are specific to layers that use fake rpms built from source.
+    extract_container_images "4.${FAKE_NEXT_MINOR_VERSION}.*" "${NEXT_REPO}" "${CONTAINER_LIST}"
+    extract_container_images "${PREVIOUS_RELEASE_VERSION}" "${PREVIOUS_RELEASE_REPO}" "${CONTAINER_LIST}"
+    extract_container_images "${YMINUS2_RELEASE_VERSION}" "${YMINUS2_RELEASE_REPO}" "${CONTAINER_LIST}"
+fi
+
 trap 'osbuild_logs' EXIT
 
-if [ -n "${GROUP}" ]; then
+# Check if webserver is running
+if [ $(pgrep -cx nginx) -eq 0 ] ; then
+    "${TESTDIR}/bin/manage_webserver.sh" "start"
+fi
+
+if [ -n "${LAYER}" ]; then
+    for group in "${LAYER}"/group*; do
+       do_group "${group}" ""
+    done
+elif [ -n "${GROUP}" ]; then
     do_group "${GROUP}" "${TEMPLATE}"
 else
-    for group in "${TESTDIR}"/image-blueprints/group*; do
+    for group in "${TESTDIR}"/image-blueprints/layer*/group*; do
         do_group "${group}" ""
     done
 fi

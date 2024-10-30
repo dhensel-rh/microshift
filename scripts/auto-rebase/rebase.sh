@@ -1,4 +1,4 @@
-#! /usr/bin/env bash
+#!/usr/bin/env bash
 # shellcheck disable=all
 #   Copyright 2022 The MicroShift authors
 #
@@ -33,10 +33,9 @@ STAGING_DIR="$REPOROOT/_output/staging"
 PULL_SECRET_FILE="${HOME}/.pull-secret.json"
 GO_MOD_DIRS=("$REPOROOT/" "$REPOROOT/etcd")
 
-EMBEDDED_COMPONENTS="route-controller-manager cluster-policy-controller hyperkube etcd kube-storage-version-migrator"
-EMBEDDED_COMPONENT_OPERATORS="cluster-kube-apiserver-operator cluster-kube-controller-manager-operator cluster-openshift-controller-manager-operator cluster-kube-scheduler-operator machine-config-operator"
-LOADED_COMPONENTS="cluster-dns-operator cluster-ingress-operator service-ca-operator cluster-network-operator
-cluster-csi-snapshot-controller-operator"
+EMBEDDED_COMPONENTS="route-controller-manager cluster-policy-controller hyperkube etcd kube-storage-version-migrator cluster-config-api"
+EMBEDDED_COMPONENT_OPERATORS="cluster-kube-apiserver-operator cluster-kube-controller-manager-operator cluster-openshift-controller-manager-operator cluster-kube-scheduler-operator machine-config-operator operator-lifecycle-manager"
+LOADED_COMPONENTS="cluster-dns-operator cluster-ingress-operator service-ca-operator cluster-network-operator cluster-csi-snapshot-controller-operator"
 declare -a ARCHS=("amd64" "arm64")
 declare -A GOARCH_TO_UNAME_MAP=( ["amd64"]="x86_64" ["arm64"]="aarch64" )
 
@@ -73,255 +72,6 @@ check_preconditions() {
         echo "ERROR: missing python's yaml library - please install"
         exit 1
     fi
-}
-
-# LVMS is not integrated into the ocp release image, so the work flow does not fit with core component rebase.  LVMS'
-# operator bundle is the authoritative source for manifest and image digests.
-download_lvms_operator_bundle_manifest(){
-    bundle_manifest="$1"
-
-    title "downloading LVMS operator bundles ${bundle_manifest}"
-    local LVMS_STAGING="${STAGING_DIR}/lvms"
-
-    authentication=""
-    if [ -f "${PULL_SECRET_FILE}" ]; then
-        authentication="--registry-config ${PULL_SECRET_FILE}"
-    else
-        >&2 echo "Warning: no pull secret found at ${PULL_SECRET_FILE}"
-    fi
-
-    for arch in ${ARCHS[@]}; do
-        mkdir -p "$LVMS_STAGING/$arch"
-        pushd "$LVMS_STAGING/$arch" || return 1
-        title "extracting lvms operator bundle for \"$arch\" architecture"
-        oc image extract \
-            ${authentication} \
-            --path /manifests/:. "$bundle_manifest" \
-            --filter-by-os "$arch" \
-            ||  {
-                    popd
-                    return 1
-                }
-
-        local csv="lvms-operator.clusterserviceversion.yaml"
-        local namespace="openshift-storage"
-        extract_lvms_rbac_from_cluster_service_version ${PWD} ${csv} ${namespace}
-
-        popd || return 1
-    done
-}
-
-parse_images() {
-    local src="$1"
-    local dest="$2"
-    yq '.spec.relatedImages[]? | [.name, .image] | @csv' $src > "$dest"
-}
-
-write_lvms_images_for_arch(){
-    local arch="$1"
-    arch_dir="${STAGING_DIR}/lvms/${arch}"
-    [ -d "$arch_dir" ] || {
-        echo "dir $arch_dir not found"
-        return 1
-    }
-
-    declare -a include_images=(
-        "topolvm-csi"
-        "topolvm-csi-provisioner"
-        "topolvm-csi-resizer"
-        "topolvm-csi-registrar"
-        "topolvm-csi-livenessprobe"
-    )
-
-    local csv_manifest="${arch_dir}/lvms-operator.clusterserviceversion.yaml"
-    local image_file="${arch_dir}/images"
-
-    parse_images "$csv_manifest" "$image_file"
-
-    if [ $(wc -l "$image_file" | cut -d' ' -f1) -eq 0 ]; then
-        >$2 echo "error: image file ($image_file) has fewer images than expected (${#include_images})"
-        exit 1
-    fi
-    while read -ers LINE; do
-        name=${LINE%,*}
-        img=${LINE#*,}
-        for included in "${include_images[@]}"; do
-            if [[ "$name" == "$included" ]]; then
-                name="$(echo "$name" | tr '-' '_')"
-                yq -iP -o=json e '.images["'"$name"'"] = "'"$img"'"' "${REPOROOT}/assets/release/release-${GOARCH_TO_UNAME_MAP[${arch}]}.json"
-                break;
-            fi
-        done
-    done < "$image_file"
-}
-
-update_lvms_images(){
-    title "Updating LVMS images"
-
-    local workdir="$STAGING_DIR/lvms"
-    [ -d "$workdir" ] || {
-        >&2 echo 'lvms staging dir not found, aborting image update'
-        return 1
-    }
-    pushd "$workdir"
-    for arch in ${ARCHS[@]}; do
-        write_lvms_images_for_arch "$arch"
-    done
-    popd
-}
-
-update_lvms_manifests() {
-    title "Copying LVMS manifests"
-
-    local workdir="$STAGING_DIR/lvms"
-    [ -d "$workdir" ] || {
-        >&2 echo 'lvms staging dir not found, aborting asset update'
-        return 1
-    }
-
-    "$REPOROOT/scripts/auto-rebase/handle_assets.py" "./scripts/auto-rebase/lvms_assets.yaml"
-}
-
-
-# In the ClusterServiceVersion there are encoded RBAC information for OLM deployments.
-# Since microshift skips this installation and uses a custom one based on the bundle, we have to extract the RBAC
-# manifests from the CSV by reading them out into separate files.
-# shellcheck disable=SC2207
-extract_lvms_rbac_from_cluster_service_version() {
-  local dest="$1"
-  local csv="$2"
-  local namespace="$3"
-
-  title "extracting lvms clusterserviceversion.yaml into separate RBAC"
-
-  local clusterPermissions=($(yq eval '.spec.install.spec.clusterPermissions[].serviceAccountName' < "${csv}"))
-  for service_account_name in "${clusterPermissions[@]}"; do
-    echo "extracting bundle .spec.install.spec.clusterPermissions by serviceAccountName ${service_account_name}"
-
-    local clusterrole="${dest}/${service_account_name}_rbac.authorization.k8s.io_v1_clusterrole.yaml"
-    echo "generating ${clusterrole}"
-    extract_lvms_clusterrole_from_csv_by_service_account_name "${service_account_name}" "${csv}" "${clusterrole}"
-
-    local clusterrolebinding="${dest}/${service_account_name}_rbac.authorization.k8s.io_v1_clusterrolebinding.yaml"
-    echo "generating ${clusterrolebinding}"
-    extract_lvms_clusterrolebinding_from_csv_by_service_account_name "${service_account_name}" "${namespace}" "${clusterrolebinding}"
-
-    local service_account="${dest}/${service_account_name}_v1_serviceaccount.yaml"
-    echo "generating ${service_account}"
-    extract_lvms_service_account_from_csv_by_service_account_name "${service_account_name}" "${namespace}" "${service_account}"
-  done
-
-  local permissions=($(yq eval '.spec.install.spec.permissions[].serviceAccountName' < "${csv}"))
-  for service_account_name in "${permissions[@]}"; do
-    echo "extracting bundle .spec.install.spec.permissions by serviceAccountName ${service_account_name}"
-
-    local role="${dest}/${service_account_name}_rbac.authorization.k8s.io_v1_role.yaml"
-    echo "generating ${role}"
-    extract_lvms_role_from_csv_by_service_account_name "${service_account_name}" "${namespace}" "${csv}" "${role}"
-
-    local rolebinding="${dest}/${service_account_name}_rbac.authorization.k8s.io_v1_rolebinding.yaml"
-    echo "generating ${rolebinding}"
-    extract_lvms_rolebinding_from_csv_by_service_account_name "${service_account_name}" "${namespace}" "${rolebinding}"
-
-    local service_account="${dest}/${service_account_name}_v1_serviceaccount.yaml"
-    echo "generating ${service_account}"
-    extract_lvms_service_account_from_csv_by_service_account_name "${service_account_name}" "${namespace}" "${service_account}"
-  done
-}
-
-extract_lvms_clusterrole_from_csv_by_service_account_name() {
-  local service_account_name="$1"
-  local csv="$2"
-  local target="$3"
-  yq eval "
-    .spec.install.spec.clusterPermissions[] |
-    select(.serviceAccountName == \"${service_account_name}\") |
-    .apiVersion = \"rbac.authorization.k8s.io/v1\" |
-    .kind = \"ClusterRole\" |
-    .metadata.name = \"${service_account_name}\" |
-    del(.serviceAccountName)
-    " "${csv}" > "${target}"
-}
-
-extract_lvms_role_from_csv_by_service_account_name() {
-  local service_account_name="$1"
-  local namespace="$2"
-  local csv="$3"
-  local target="$4"
-  yq eval "
-    .spec.install.spec.permissions[] |
-    select(.serviceAccountName == \"${service_account_name}\") |
-    .apiVersion = \"rbac.authorization.k8s.io/v1\" |
-    .kind = \"Role\" |
-    .metadata.name = \"${service_account_name}\" |
-    .metadata.namespace = \"${namespace}\" |
-    del(.serviceAccountName)
-    " "${csv}" > "${target}"
-}
-
-extract_lvms_clusterrolebinding_from_csv_by_service_account_name() {
-  local service_account_name="$1"
-  local namespace="$2"
-  local target="$3"
-
-  crb=$(cat <<EOL
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: ${service_account_name}
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: ${service_account_name}
-subjects:
-- kind: ServiceAccount
-  name: ${service_account_name}
-  namespace: ${namespace}
-EOL
-)
-  echo "${crb}" > "${target}"
-}
-
-extract_lvms_rolebinding_from_csv_by_service_account_name() {
-  local service_account_name="$1"
-  local namespace="$2"
-  local target="$3"
-
-  crb=$(cat <<EOL
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: ${service_account_name}
-  namespace: ${namespace}
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: ${service_account_name}
-  namespace: ${namespace}
-subjects:
-- kind: ServiceAccount
-  name: ${service_account_name}
-  namespace: ${namespace}
-EOL
-)
-  echo "${crb}" > "${target}"
-}
-
-extract_lvms_service_account_from_csv_by_service_account_name() {
-  local service_account_name="$1"
-  local namespace="$2"
-  local target="$3"
-
-  serviceAccount=$(cat <<EOL
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  creationTimestamp: null
-  name: ${service_account_name}
-  namespace: ${namespace}
-EOL
-)
-    echo "${serviceAccount}" > "${target}"
 }
 
 # Clone a repo at a commit
@@ -464,7 +214,10 @@ require_using_component_commit() {
     commit=$( cd "${STAGING_DIR}/${component}" && git rev-parse HEAD )
     echo "go mod edit -require ${modulepath}@${commit}"
     go mod edit -require "${modulepath}@${commit}"
-    go mod tidy # needed to replace commit with pseudoversion before next invocation of go mod edit
+    # Before calling edit we need to tidy. Since dependencies may be broken in between different
+    # edit and tidy commands, allow errors. A final tidy runs without -e to ensure all dependencies
+    # are ok.
+    go mod tidy -e
 }
 
 # Updates a replace directive using an embedded component's commit.
@@ -483,7 +236,10 @@ replace_using_component_commit() {
         commit=$( cd "${STAGING_DIR}/${reponame}" && git rev-parse HEAD )
         echo "go mod edit -replace ${modulepath}=${new_modulepath}@${commit}"
         go mod edit -replace "${modulepath}=${new_modulepath}@${commit}"
-        go mod tidy # needed to replace commit with pseudoversion before next invocation of go mod edit
+        # Before calling edit we need to tidy. Since dependencies may be broken in between different
+        # edit and tidy commands, allow errors. A final tidy runs without -e to ensure all dependencies
+        # are ok.
+        go mod tidy -e
         pseudoversion=$(grep_pseudoversion "$(get_replace_directive "$(pwd)/go.mod" "${modulepath}")")
         pseudoversions["${component}"]="${pseudoversion}"
     fi
@@ -713,11 +469,21 @@ update_go_mod() {
 
 # Updates go.mod file in dirs defined in GO_MOD_DIRS
 update_go_mods() {
+    # Update Go versions in the go.mod based on values in kubernetes' and etcd's go.mod
+    kubernetes_go_version=$(go mod edit -json "${STAGING_DIR}/kubernetes/go.mod" | jq -r '.Go')
+    go mod edit -go="${kubernetes_go_version}" "${REPOROOT}/go.mod"
+
+    etcd_go_version=$(go mod edit -json "${STAGING_DIR}/etcd/go.mod" | jq -r '.Go')
+    go mod edit -go="${etcd_go_version}" "${REPOROOT}/etcd/go.mod"
+
     for d in "${GO_MOD_DIRS[@]}"; do
         pushd "${d}" > /dev/null
         update_go_mod
         popd > /dev/null
     done
+    # Remove the toolchain to avoid downloading a different golang version when building with
+    # ART images.
+    go mod edit -toolchain=none "${REPOROOT}/etcd/go.mod"
  }
 
 # Regenerates OpenAPIs after patching the vendor directory
@@ -778,7 +544,7 @@ update_images() {
             .references.spec.tags[] | select(.name == "pod") | .from.name
             ' "release_${goarch}.json")
         sed -i "s|pause_image =.*|pause_image = \"${pause_image_digest}\"|g" \
-            "${REPOROOT}/packaging/crio.conf.d/microshift_${goarch}.conf"
+            "${REPOROOT}/packaging/crio.conf.d/10-microshift_${goarch}.conf"
     done
 
     popd >/dev/null
@@ -804,6 +570,73 @@ update_openshift_manifests() {
 
     title "Modifying OpenShift manifests"
 
+    #-- Kubelet -------------------------------------------
+
+    # The tlsCipherSuites field was change from a scalar value to gotemplate which broke the yaml formatting and
+    # confused yq. Before processing, delete the offending go templated field.
+    # https://github.com/openshift/machine-config-operator/commit/3b979e1ddf2a6e2c3e9b4a7872e31db888da1d57
+    sed -i '/tlsCipherSuites:/,/{{- end }}/d' "${REPOROOT}/assets/core/kubelet.yaml"
+
+    # Drop MCO's boilerplate and keep KubeletConfiguration only
+    yq -i '.contents.inline' "${REPOROOT}/assets/core/kubelet.yaml"
+
+    yq -i '.authentication.x509.clientCAFile = "{{ .clientCAFile }}" | .authentication.x509.clientCAFile style="double"' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i '.clusterDNS = [ "{{ .clusterDNSIP }}" ] | .clusterDNS[] style="double"' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i '.tlsCertFile = "{{ .tlsCertFile }}" | .tlsCertFile style="double"' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i '.tlsPrivateKeyFile = "{{ .tlsPrivateKeyFile }}" | .tlsPrivateKeyFile style="double"' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i '.volumePluginDir = "{{ .volumePluginDir }}" | .volumePluginDir style="double"' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i '.failSwapOn = false' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i '.enforceNodeAllocatable = []' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i '.containerRuntimeEndpoint = "unix:///var/run/crio/crio.sock"' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i '.cgroupsPerQOS = true' "${REPOROOT}/assets/core/kubelet.yaml"
+
+    yq -i 'del(.podPidsLimit)' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i 'del(.protectKernelDefaults)' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i 'del(.staticPodPath)' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i 'del(.cgroupRoot)' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i 'del(.enableSystemLogQuery)' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i 'del(.podPidsLimit)' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i 'del(.protectKernelDefaults)' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i 'del(.systemCgroups)' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i 'del(.nodeStatusUpdateFrequency)' "${REPOROOT}/assets/core/kubelet.yaml"
+
+    yq -i '.rotateCertificates = false | .rotateCertificates line_comment="TODO"' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i '.serverTLSBootstrap = false | .serverTLSBootstrap line_comment="TODO"' "${REPOROOT}/assets/core/kubelet.yaml"
+
+    yq -i 'del(.tlsMinVersion)' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i 'del(.tlsCipherSuites)' "${REPOROOT}/assets/core/kubelet.yaml"
+
+    # Clear and re-create featureGates
+    yq -i 'del(.featureGates.AlibabaPlatform)' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i 'del(.featureGates.AzureWorkloadIdentity)' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i 'del(.featureGates.BuildCSIVolumes)' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i 'del(.featureGates.CloudDualStackNodeIPs)' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i 'del(.featureGates.ExternalCloudProvider)' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i 'del(.featureGates.ExternalCloudProviderAzure)' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i 'del(.featureGates.ExternalCloudProviderGCP)' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i 'del(.featureGates.ExternalCloudProviderExternal)' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i 'del(.featureGates.OpenShiftPodSecurityAdmission)' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i 'del(.featureGates.PrivateHostedZoneAWS)' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i 'del(.featureGates.RetroactiveDefaultStorageClass)' "${REPOROOT}/assets/core/kubelet.yaml"
+
+    yq -i '.featureGates.APIPriorityAndFairness = true' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i '.featureGates.PodSecurity = true' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i '.featureGates.DownwardAPIHugePages = true' "${REPOROOT}/assets/core/kubelet.yaml"
+    yq -i '.featureGates.RotateKubeletServerCertificate = false | .featureGates.RotateKubeletServerCertificate line_comment="TODO"' "${REPOROOT}/assets/core/kubelet.yaml"
+
+    # Sort the document, except for kind and apiVersion
+    yq -i 'sort_keys(..) | pick((["kind","apiVersion"] + keys) | unique)' "${REPOROOT}/assets/core/kubelet.yaml"
+
+    # Add optional resolvConf & userProvidedConfig
+    cat << 'EOF' >> "${REPOROOT}/assets/core/kubelet.yaml"
+{{- if .resolvConf }}
+resolvConf: "{{ .resolvConf }}"
+{{- end }}
+{{ if .userProvidedConfig }}
+{{- .userProvidedConfig -}}
+{{ end }}
+EOF
+
     #-- OpenShift control plane ---------------------------
     yq -i 'with(.admission.pluginConfig.PodSecurity.configuration.defaults;
         .enforce = "restricted" | .audit = "restricted" | .warn = "restricted" |
@@ -811,7 +644,7 @@ update_openshift_manifests() {
     yq -i 'del(.extendedArguments.pv-recycler-pod-template-filepath-hostpath)' "${REPOROOT}"/assets/controllers/kube-controller-manager/defaultconfig.yaml
     yq -i 'del(.extendedArguments.pv-recycler-pod-template-filepath-nfs)' "${REPOROOT}"/assets/controllers/kube-controller-manager/defaultconfig.yaml
     yq -i 'del(.extendedArguments.flex-volume-plugin-dir)' "${REPOROOT}"/assets/controllers/kube-controller-manager/defaultconfig.yaml
-    yq -i '.spec.names.shortNames = ["scc"]' "${REPOROOT}"/assets/crd/0000_03_security-openshift_01_scc.crd.yaml
+    yq -i '.spec.names.shortNames = ["scc"]' "${REPOROOT}"/assets/crd/0000_03_config-operator_01_securitycontextconstraints.crd.yaml
 
     #-- openshift-dns -------------------------------------
     # Render operand manifest templates like the operator would
@@ -861,7 +694,7 @@ update_openshift_manifests() {
     yq -i '.spec.template.spec.containers[0].env += {"name": "ROUTER_CIPHERS", "value": "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384"}' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
     yq -i '.spec.template.spec.containers[0].env += {"name": "ROUTER_CIPHERSUITES", "value": "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256"}' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
     yq -i '.spec.template.spec.containers[0].env += {"name": "ROUTER_DISABLE_HTTP2", "value": "true"}' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
-    yq -i '.spec.template.spec.containers[0].env += {"name": "ROUTER_DISABLE_NAMESPACE_OWNERSHIP_CHECK", "value": "false"}' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
+    yq -i '.spec.template.spec.containers[0].env += {"name": "ROUTER_DISABLE_NAMESPACE_OWNERSHIP_CHECK", "value": "{{.RouterNamespaceOwnership}}"}' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
     yq -i '.spec.template.spec.containers[0].env += {"name": "ROUTER_LOAD_BALANCE_ALGORITHM", "value": "random"}' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
     # TODO: Generate and volume mount the metrics-certs secret
     # yq -i '.spec.template.spec.containers[0].env += {"name": "ROUTER_METRICS_TLS_CERT_FILE", "value": "/etc/pki/tls/metrics-certs/tls.crt"}' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
@@ -872,6 +705,11 @@ update_openshift_manifests() {
     yq -i '.spec.template.spec.containers[0].env += {"name": "ROUTER_TCP_BALANCE_SCHEME", "value": "source"}' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
     yq -i '.spec.template.spec.containers[0].env += {"name": "ROUTER_THREADS", "value": "4"}' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
     yq -i '.spec.template.spec.containers[0].env += {"name": "SSL_MIN_VERSION", "value": "TLSv1.2"}' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
+    #    Not use proxy protocol due to lack of load balancer support
+    yq -i '.spec.template.spec.containers[0].env += {"name": "ROUTER_USE_PROXY_PROTOCOL", "value": "false"}' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
+    yq -i '.spec.template.spec.containers[0].env += {"name": "GRACEFUL_SHUTDOWN_DELAY", "value": "1s"}' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
+    yq -i '.spec.template.spec.containers[0].env += {"name": "ROUTER_DOMAIN", "value": "apps.{{ .BaseDomain }}"}' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
+    yq -i '.spec.template.spec.containers[0].env += {"name": "ROUTER_IP_V4_V6_MODE", "value": "{{ .RouterMode }}"}' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
     # TODO: Generate and volume mount the router-stats-default secret
     # yq -i '.spec.template.spec.containers[0].env += {"name": "STATS_PASSWORD_FILE", "value": "/var/lib/haproxy/conf/metrics-auth/statsPassword"}' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
     # yq -i '.spec.template.spec.containers[0].env += {"name": "STATS_USERNAME_FILE", "value": "/var/lib/haproxy/conf/metrics-auth/statsUsername"}' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
@@ -879,8 +717,8 @@ update_openshift_manifests() {
     yq -i '.spec.template.spec.containers[0].ports += {"name": "http", "containerPort": 80, "protocol": "TCP"}' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
     yq -i '.spec.template.spec.containers[0].ports += {"name": "https", "containerPort": 443, "protocol": "TCP"}' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
     yq -i '.spec.template.spec.containers[0].ports += {"name": "metrics", "containerPort": 1936, "protocol": "TCP"}' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
+    yq -i '.spec.template.spec.containers[0].args = ["-v=4"]' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
     yq -i '.spec.template.spec.restartPolicy = "Always"' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
-    yq -i '.spec.template.spec.terminationGracePeriodSeconds = 3600' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
     yq -i '.spec.template.spec.dnsPolicy = "ClusterFirst"' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
     yq -i '.spec.template.spec.nodeSelector = {"kubernetes.io/os": "linux", "node-role.kubernetes.io/worker": ""}' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
     yq -i '.spec.template.spec.serviceAccount = "router"' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
@@ -892,6 +730,7 @@ update_openshift_manifests() {
     yq -i '.metadata.labels += {"ingresscontroller.operator.openshift.io/owning-ingresscontroller": "default"}' "${REPOROOT}"/assets/components/openshift-router/service-internal.yaml
     yq -i '.metadata += {"name": "router-internal-default", "namespace": "openshift-ingress"}' "${REPOROOT}"/assets/components/openshift-router/service-internal.yaml
     yq -i '.spec.selector = {"ingresscontroller.operator.openshift.io/deployment-ingresscontroller": "default"}' "${REPOROOT}"/assets/components/openshift-router/service-internal.yaml
+    yq -i '.spec.ipFamilyPolicy = "{{.IPFamily}}"' "${REPOROOT}"/assets/components/openshift-router/service-internal.yaml
     sed -i '/#.*set at runtime/d' "${REPOROOT}"/assets/components/openshift-router/service-internal.yaml
 
     # MicroShift-specific changes
@@ -901,13 +740,14 @@ update_openshift_manifests() {
     yq -i '.spec.replicas = 1' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
     #    Set deployment strategy type to Recreate.
     yq -i '.spec.strategy.type = "Recreate"' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
-    #    Add hostPorts for routes and metrics (needed as long as there is no load balancer)
-    yq -i '.spec.template.spec.containers[0].ports[0].hostPort = 80' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
-    yq -i '.spec.template.spec.containers[0].ports[1].hostPort = 443' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
-    #    Not use proxy protocol due to lack of load balancer support
-    yq -i '.spec.template.spec.containers[0].env += {"name": "ROUTER_USE_PROXY_PROTOCOL", "value": "false"}' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
-    yq -i '.spec.template.spec.containers[0].env += {"name": "GRACEFUL_SHUTDOWN_DELAY", "value": "1s"}' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
-    yq -i '.spec.template.spec.containers[0].env += {"name": "ROUTER_DOMAIN", "value": "apps.{{ .BaseDomain }}"}' "${REPOROOT}"/assets/components/openshift-router/deployment.yaml
+    #    Configure LoadBalancer service
+    yq -i '.metadata += {"name": "router-default", "namespace": "openshift-ingress"}' "${REPOROOT}"/assets/components/openshift-router/service-cloud.yaml
+    yq -i '.spec.selector = {"ingresscontroller.operator.openshift.io/deployment-ingresscontroller": "default"}' "${REPOROOT}"/assets/components/openshift-router/service-cloud.yaml
+    yq -i '.metadata.labels += {"ingresscontroller.operator.openshift.io/owning-ingresscontroller": "default"}' "${REPOROOT}"/assets/components/openshift-router/service-cloud.yaml
+    yq -i '.spec.ipFamilyPolicy = "{{.IPFamily}}"' "${REPOROOT}"/assets/components/openshift-router/service-cloud.yaml
+    # Must use sed instead of yq because unquoted {{ .RouterHttpPort }} is interpreted as yaml object and yq has no option to not interpret it (like provide is as quoted string but produce unquoted output).
+    # It needs to be last manipulation of the file, otherwise yq commands after this one would expand the {{ .RouterHttpPort }}.
+    sed -i 's/port: 80/port: {{ .RouterHttpPort }}/g; s/port: 443/port: {{ .RouterHttpsPort }}/g' "${REPOROOT}"/assets/components/openshift-router/service-cloud.yaml
 
     #-- service-ca ----------------------------------------
     # Render operand manifest templates like the operator would
@@ -942,6 +782,7 @@ update_openshift_manifests() {
     yq -i 'with(.spec.template.spec.containers[0].securityContext; .runAsUser = 65534)' $target
 
     yq -i '.metadata.namespace = "kube-system"' "${REPOROOT}/assets/components/csi-snapshot-controller/webhook_service.yaml"
+    yq -i '.metadata.namespace = "kube-system"' "${REPOROOT}/assets/components/csi-snapshot-controller/webhook_serviceaccount.yaml"
 
     yq -i '.webhooks[0].clientConfig.service.namespace="kube-system"' "${REPOROOT}/assets/components/csi-snapshot-controller/webhook_config.yaml"
 
@@ -952,6 +793,9 @@ update_openshift_manifests() {
     # snapshotter's rbac is defined as a multidoc, which MicroShift is too picky to work with. Split into separate files
     yq 'select(.kind == "ClusterRole")' $target > "$(dirname $target)/clusterrole.yaml"
     yq 'select(.kind == "ClusterRoleBinding")' $target > "$(dirname $target)/clusterrolebinding.yaml"
+
+    update_olm_images
+    update_multus_images
 
     popd >/dev/null
 }
@@ -1104,6 +948,174 @@ checkout_rebase_branch() {
     git checkout -b "${rebase_branch}"
 }
 
+update_multus_images() {
+    title "Rebasing Multus images"
+
+    for goarch in amd64 arm64; do
+        arch=${GOARCH_TO_UNAME_MAP["${goarch}"]:-noarch}
+
+        local release_file="${STAGING_DIR}/release_${goarch}.json"
+        local kustomization_arch_file="${REPOROOT}/assets/optional/multus/kustomization.${arch}.yaml"
+        local multus_release_json="${REPOROOT}/assets/optional/multus/release-multus-${arch}.json"
+
+        local base_release
+        base_release=$(jq -r ".metadata.version" "${release_file}")
+        jq -n "{\"release\": {\"base\": \"$base_release\"}, \"images\": {}}" > "${multus_release_json}"
+
+        # Create extra kustomization for each arch in separate file.
+        # Right file (depending on arch) should be appended during rpmbuild to kustomization.yaml.
+        cat <<EOF > "${kustomization_arch_file}"
+
+images:
+EOF
+
+        for container in multus-cni-microshift containernetworking-plugins-microshift; do
+            local new_image
+            new_image=$(jq -r ".references.spec.tags[] | select(.name == \"${container}\") | .from.name" "${release_file}")
+            local new_image_name="${new_image%@*}"
+            local new_image_digest="${new_image#*@}"
+
+            cat <<EOF >> "${kustomization_arch_file}"
+  - name: ${container}
+    newName: ${new_image_name}
+    digest: ${new_image_digest}
+EOF
+
+            yq -i -o json ".images += {\"${container}\": \"${new_image}\"}" "${multus_release_json}"
+        done  # for container
+    done  # for goarch
+}
+
+update_olm_images() {
+    title "Rebasing operator-lifecycle-manager manifests"
+
+    # Replace hardcoded image refs with variables. Variables will be provided via kustomize's patches (added to `env`).
+    # Expr with --util-image finds line with --util-image and edits the line after.
+    sed -i \
+        -e 's,--configmapServerImage=.*$,--configmapServerImage=$(OPERATOR_REGISTRY_IMAGE),g' \
+        -e 's,--opmImage=.*$,--opmImage=$(OPERATOR_REGISTRY_IMAGE),g' \
+        -e '/--util-image/{n;s,-.*,- \$\(OLM_IMAGE\),;}' \
+        "${REPOROOT}/assets/optional/operator-lifecycle-manager/0000_50_olm_08-catalog-operator.deployment.yaml"
+
+    # Remove tag/digest from images so they don't change on rebase unless the image name itself changes.
+    # This way, check_for_manifests_changes() will be able to focus on limited list of files.
+    sed -i -r 's,(image: [a-z./-]*)[@:].*,\1,' "${REPOROOT}/assets/optional/operator-lifecycle-manager/0000_50_olm_07-olm-operator.deployment.yaml"
+    sed -i -r 's,(image: [a-z./-]*)[@:].*,\1,' "${REPOROOT}/assets/optional/operator-lifecycle-manager/0000_50_olm_08-catalog-operator.deployment.yaml"
+
+    # If namespaces sourced from openshift/operator-lifecycle-manager do not contain openshift-marketplace - add it.
+    # This conditional will make the transition easier when the namespace is added in upstream manifests.
+    if ! grep -qw "openshift-marketplace" "${REPOROOT}/assets/optional/operator-lifecycle-manager/0000_50_olm_00-namespace.yaml"; then
+        cat <<EOF >> "${REPOROOT}/assets/optional/operator-lifecycle-manager/0000_50_olm_00-namespace.yaml"
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openshift-marketplace
+  labels:
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: "v1.24"
+    openshift.io/scc: ""
+  annotations:
+    openshift.io/node-selector: ""
+    workload.openshift.io/allowed: "management"
+    include.release.openshift.io/ibm-cloud-managed: "true"
+    include.release.openshift.io/self-managed-high-availability: "true"
+    capability.openshift.io/name: "OperatorLifecycleManager"
+EOF
+    fi
+
+    for goarch in amd64 arm64; do
+        arch=${GOARCH_TO_UNAME_MAP["${goarch}"]:-noarch}
+
+        # Get the images for the OLM operator from ${STAGING_DIR}/release_${arch}.json:
+        # - operator-lifecycle-manager
+        # - operator-registry
+        # - kube-rbac-proxy
+        local release_file="${STAGING_DIR}/release_${goarch}.json"
+        local olm_image_refs_file="${REPOROOT}/assets/optional/operator-lifecycle-manager/image-references"
+        local kustomization_arch_file="${REPOROOT}/assets/optional/operator-lifecycle-manager/kustomization.${arch}.yaml"
+        local olm_release_json="${REPOROOT}/assets/optional/operator-lifecycle-manager/release-olm-${arch}.json"
+
+        # Create the OLM release-${arch}.json file, this is the file included on the RPM.
+        local base_release
+        base_release=$(jq -r ".metadata.version" "${release_file}")
+        jq -n "{\"release\": {\"base\": \"$base_release\"}, \"images\": {}}" > "${olm_release_json}"
+
+        # Create extra kustomization for each arch in separate file.
+        # Right file (depending on arch) should be appended during rpmbuild to kustomization.yaml.
+        cat <<EOF > "${kustomization_arch_file}"
+
+images:
+EOF
+
+        # Read from the global release file, to find the images we need to use.
+        local containers=$(yq -r '.spec.tags[].name' "${olm_image_refs_file}")
+        for container in ${containers[@]}; do
+            # Get image (registry.com/image) without the tag or digest that is present in OLM's yamls and image-references.
+            local orig_image_name
+            orig_image_name=$(yq -r ".spec.tags[] | select(.name == \"${container}\") | .from.name" "${olm_image_refs_file}" | awk -F '[@:]' '{ print $1; }')
+
+            # Get name and digest to replace OLM's image
+            local new_image
+            new_image=$(jq -r ".references.spec.tags[] | select(.name == \"${container}\") | .from.name" "${release_file}")
+            local new_image_name="${new_image%@*}"
+            local new_image_digest="${new_image#*@}"
+
+            cat <<EOF >> "${kustomization_arch_file}"
+  - name: ${orig_image_name}
+    newName: ${new_image_name}
+    digest: ${new_image_digest}
+EOF
+
+            yq -i -o json ".images += {\"${container}\": \"${new_image}\"}" "${olm_release_json}"
+        done  # for container
+
+        # kustomize's `images` transformer does not replace image refs outside `image: ` fields.
+        # Following builds a patch to add required images as envs to be used with sed expressions executed above.
+        local olm_image
+        olm_image=$(jq -r '.references.spec.tags[] | select(.name == "operator-lifecycle-manager") | .from.name' "${release_file}")
+        local registry_image
+        registry_image=$(jq -r '.references.spec.tags[] | select(.name == "operator-registry") | .from.name' "${release_file}")
+
+        cat << EOF >> "${kustomization_arch_file}"
+
+patches:
+  - patch: |-
+     - op: add
+       path: /spec/template/spec/containers/0/env/-
+       value:
+         name: OPERATOR_REGISTRY_IMAGE 
+         value: ${registry_image}
+     - op: add
+       path: /spec/template/spec/containers/0/env/-
+       value:
+         name: OLM_IMAGE 
+         value: ${olm_image}
+    target:
+      kind: Deployment
+      labelSelector: app=catalog-operator
+EOF
+    done  # for goarch
+}
+
+check_for_manifests_changes() {
+    # Changes to ignore:
+    # - `release-$ARCH.json` files
+    # - OLM's image-references and kustomization.$ARCH.yaml files
+    local ignores="(release-(aarch64|x86_64).json|image-references|kustomization.(aarch64|x86_64).yaml)"
+
+    title "Checking assets for unexpected changes"
+    git status -s assets
+
+    if [[ "$(git status -s assets | grep -vE "${ignores}" | wc -l)" -eq 0 ]]; then
+        return 0
+    fi
+
+    title "\nERROR: Unexpected changes in assets"
+    git --no-pager diff --unified=0 $(git status -s assets | grep -vE "${ignores}" | cut -d' ' -f3)
+    return 1
+}
+
 # Runs each OCP rebase step in sequence, commiting the step's output to git
 rebase_to() {
     local release_image_amd64=$1
@@ -1126,7 +1138,7 @@ rebase_to() {
             git commit -m "update ${dirname}/go.mod"
 
             title "## Updating ${dirname}/vendor directory"
-            (cd "${dirpath}" && make vendor)
+            pushd "${dirpath}" && make vendor && popd || exit 1
             if [[ -n "$(git status -s "${dirpath}/vendor")" ]]; then
                 title "## Commiting changes to ${dirname}/vendor directory"
                 git add "${dirpath}/vendor"
@@ -1150,6 +1162,9 @@ rebase_to() {
     copy_manifests
     update_openshift_manifests
     if [[ -n "$(git status -s assets)" ]]; then
+        if [[ -n "${FAIL_ON_MANIFEST_CHANGE+x}" ]] && [[ "${FAIL_ON_MANIFEST_CHANGE}" == "1" ]]; then
+            check_for_manifests_changes
+        fi
         title "## Committing changes to assets and pkg/assets"
         git add assets pkg/assets
         git commit -m "update manifests"
@@ -1164,65 +1179,6 @@ rebase_to() {
         git commit -m "update buildfiles"
     else
         echo "No changes to buildfiles."
-    fi
-
-    title "# Removing staging directory"
-    rm -rf "${STAGING_DIR}"
-}
-
-update_last_lvms_rebase() {
-    local lvms_operator_bundle_manifest="$1"
-
-    title "## Updating last_lvms_rebase.sh"
-
-    local last_rebase_script="${REPOROOT}/scripts/auto-rebase/last_lvms_rebase.sh"
-
-    rm -f "${last_rebase_script}"
-    cat - >"${last_rebase_script}" <<EOF
-#!/bin/bash -x
-./scripts/auto-rebase/rebase.sh lvms-to "${lvms_operator_bundle_manifest}"
-EOF
-    chmod +x "${last_rebase_script}"
-
-    (cd "${REPOROOT}" && \
-         if test -n "$(git status -s scripts/auto-rebase/last_lvms_rebase.sh)"; then \
-             title "## Committing changes to last_lvms_rebase.sh" && \
-             git add scripts/auto-rebase/last_lvms_rebase.sh && \
-             git commit -m "update last_lvms_rebase.sh"; \
-         fi)
-}
-
-# Runs each LVMS rebase step in sequence, commiting the step's output to git
-rebase_lvms_to() {
-    local lvms_operator_bundle_manifest="$1"
-
-    title "# Rebasing LVMS to ${lvms_operator_bundle_manifest}"
-
-    download_lvms_operator_bundle_manifest "${lvms_operator_bundle_manifest}"
-
-    # LVMS image names may include `/` and `:`, which make messy branch names.
-    rebase_branch="rebase-lvms-${lvms_operator_bundle_manifest//[:\/]/-}"
-    git branch -D "${rebase_branch}" || true
-    git checkout -b "${rebase_branch}"
-
-    update_last_lvms_rebase "${lvms_operator_bundle_manifest}"
-
-    update_lvms_images
-    if [[ -n "$(git status -s pkg/release)" ]]; then
-        title "## Committing changes to pkg/release"
-        git add pkg/release
-        git commit -m "update LVMS images"
-    else
-        echo "No changes in LVMS images."
-    fi
-
-    update_lvms_manifests
-    if [[ -n "$(git status -s assets)" ]]; then
-        title "## Committing changes to assets and pkg/assets"
-        git add assets pkg/assets
-        git commit -m "update LVMS manifests"
-    else
-        echo "No changes to LVMS assets."
     fi
 
     title "# Removing staging directory"
@@ -1296,18 +1252,6 @@ case "$command" in
     manifests)
         copy_manifests
         update_openshift_manifests
-        ;;
-    lvms-to)
-        rebase_lvms_to "$2"
-        ;;
-    lvms-download)
-        download_lvms_operator_bundle_manifest "$2"
-        ;;
-    lvms-images)
-        update_lvms_images
-        ;;
-    lvms-manifests)
-        update_lvms_manifests
         ;;
     *) usage;;
 esac

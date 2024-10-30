@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"k8s.io/utils/ptr"
 )
 
 const (
@@ -94,6 +95,7 @@ func TestGetActiveConfigFromYAML(t *testing.T) {
 				c.Network.ServiceNetwork = []string{"40.30.20.10/16"}
 				c.Network.ServiceNodePortRange = "1024-32767"
 				c.ApiServer.AdvertiseAddress = ""           // force value to be recomputed
+				c.Ingress.ListenAddress = nil               // force value to be recomputed
 				assert.NoError(t, c.updateComputedValues()) // recomputes DNS field
 				return c
 			}(),
@@ -129,15 +131,46 @@ func TestGetActiveConfigFromYAML(t *testing.T) {
 			}(),
 		},
 		{
+			name: "api-server-named-certificates",
+			config: dedent(`
+			        apiServer:
+			          namedCertificates:
+			          - certPath: /tmp/fqdn-server-1.pem
+			            keyPath: /tmp/fqdn-server-1.key
+			            names: 
+			            - fqdn-server-1						
+			          - certPath: /tmp/fqdn-server-2.pem
+			            keyPath: /tmp/fqdn-server-2.key
+			        `),
+
+			expected: func() *Config {
+				c := mkDefaultConfig()
+				c.ApiServer.NamedCertificates = []NamedCertificateEntry{
+					{
+						Names:    []string{"fqdn-server-1"},
+						CertPath: "/tmp/fqdn-server-1.pem",
+						KeyPath:  "/tmp/fqdn-server-1.key",
+					},
+					{
+						CertPath: "/tmp/fqdn-server-2.pem",
+						KeyPath:  "/tmp/fqdn-server-2.key",
+					},
+				}
+				return c
+			}(),
+		},
+		{
 			name: "api-server-advertise-address",
 			config: dedent(`
             apiServer:
-              advertiseAddress: 4.3.2.1
+              advertiseAddress: 127.0.0.1
             `),
 			expected: func() *Config {
 				c := mkDefaultConfig()
-				c.ApiServer.AdvertiseAddress = "4.3.2.1"
+				c.ApiServer.AdvertiseAddress = "127.0.0.1"
 				c.ApiServer.SkipInterface = true
+				c.Ingress.ListenAddress = nil
+				assert.NoError(t, c.updateComputedValues()) // recomputes ingress listenAddress field
 				return c
 			}(),
 		},
@@ -244,12 +277,122 @@ func TestGetActiveConfigFromYAML(t *testing.T) {
 				return c
 			}(),
 		},
+		{
+			name: "router-managed",
+			config: dedent(`
+            ingress:
+              status: Managed
+            `),
+			expected: func() *Config {
+				c := mkDefaultConfig()
+				c.Ingress.Status = StatusManaged
+				return c
+			}(),
+		},
+		{
+			name: "router-removed",
+			config: dedent(`
+            ingress:
+              status: Removed
+            `),
+			expected: func() *Config {
+				c := mkDefaultConfig()
+				c.Ingress.Status = StatusRemoved
+				return c
+			}(),
+		},
+		{
+			name: "router-ports",
+			config: dedent(`
+			ingress:
+			  ports:
+			    http: 1234
+			    https: 9876
+			`),
+			expected: func() *Config {
+				c := mkDefaultConfig()
+				c.Ingress.Ports.Http = ptr.To[int](1234)
+				c.Ingress.Ports.Https = ptr.To[int](9876)
+				return c
+			}(),
+		},
+		{
+			name: "ingress-listen-address-nic",
+			config: dedent(`
+            ingress:
+              listenAddress:
+                - lo
+            `),
+			expected: func() *Config {
+				c := mkDefaultConfig()
+				c.Ingress.ListenAddress = []string{"lo"}
+				return c
+			}(),
+		},
+		{
+			name: "kubelet",
+			config: dedent(`
+            kubelet:
+              cpuManagerPolicy: static
+              reservedMemory:
+              - limits:
+                  memory: 1100Mi
+                numaNode: 0
+              kubeReserved:
+                memory: 500Mi
+              evictionHard:
+                imagefs.available: 15%
+                memory.available: 100Mi
+                nodefs.available: 10%
+                nodefs.inodesFree: 5%
+            `),
+			expected: func() *Config {
+				c := mkDefaultConfig()
+				c.Kubelet = map[string]any{
+					"cpuManagerPolicy": "static",
+					"reservedMemory": []any{
+						map[string]any{
+							"limits": map[string]any{
+								"memory": "1100Mi",
+							},
+							"numaNode": float64(0),
+						},
+					},
+					"kubeReserved": map[string]any{
+						"memory": "500Mi",
+					},
+					"evictionHard": map[string]any{
+						"imagefs.available": "15%",
+						"memory.available":  "100Mi",
+						"nodefs.available":  "10%",
+						"nodefs.inodesFree": "5%",
+					},
+				}
+				return c
+			}(),
+		}, {
+			name: "storage",
+			config: dedent(`
+			storage:
+			  driver: "none"
+			  optionalCsiComponents:
+			  - "snapshot-controller" 
+			  - "snapshot-webhook"
+			`),
+			expected: func() *Config {
+				c := mkDefaultConfig()
+				c.Storage = Storage{
+					Driver:                CsiDriverNone,
+					OptionalCSIComponents: []OptionalCsiComponent{CsiComponentSnapshot, CsiComponentSnapshotWebhook},
+				}
+				return c
+			}(),
+		},
 	}
 
 	for _, tt := range ttests {
 		t.Run(tt.name, func(t *testing.T) {
-			config, err := getActiveConfigFromYAML([]byte(tt.config))
-
+			config, err := getActiveConfigFromYAMLDropins([][]byte{[]byte(tt.config)})
 			// If we have any warnings, drop them. Use an empty array
 			// instead of nil so that we can differentiate between
 			// unexpected warnings (where we get an array instead of
@@ -275,13 +418,85 @@ func TestGetActiveConfigFromYAML(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("multiple-drop-ins", func(t *testing.T) {
+		dropins := [][]byte{
+			// Individual fields should be overwritten
+			[]byte(dedent(`
+            ingress:
+              ports:
+                http: 1234
+                https: 9876
+            `)),
+			[]byte(dedent(`
+            ingress:
+              ports:
+                http: 2345
+            `)),
+			[]byte(dedent(`
+            ingress:
+              ports:
+                https: 8765
+            `)),
+
+			// Arrays are overwritten completely (no addition)
+			[]byte(dedent(`
+            ingress:
+              listenAddress:
+                - eth1
+                - eth2
+            `)),
+			[]byte(dedent(`
+            ingress:
+              listenAddress:
+                - lo
+            `)),
+
+			// Even though kubelet is map[string]any, we want to merge individual settings
+			[]byte(dedent(`
+            kubelet:
+              cpuManagerPolicy: static
+              evictionHard:
+                imagefs.available: 15%
+                memory.available: 100Mi
+            `)),
+			[]byte(dedent(`
+            kubelet:
+              memoryManagerPolicy: Static
+              evictionHard:
+                nodefs.available: 10%
+                nodefs.inodesFree: 5%
+            `)),
+		}
+
+		expected := mkDefaultConfig()
+		expected.Ingress.Ports.Http = ptr.To[int](2345)
+		expected.Ingress.Ports.Https = ptr.To[int](8765)
+		expected.Ingress.ListenAddress = []string{"lo"}
+		expected.Kubelet = map[string]any{
+			"cpuManagerPolicy":    "static",
+			"memoryManagerPolicy": "Static",
+			"evictionHard": map[string]any{
+				"imagefs.available": "15%",
+				"memory.available":  "100Mi",
+				"nodefs.available":  "10%",
+				"nodefs.inodesFree": "5%",
+			},
+		}
+
+		config, err := getActiveConfigFromYAMLDropins(dropins)
+		assert.NoError(t, err)
+
+		config.userSettings = nil
+		assert.Equal(t, expected, config)
+	})
 }
 
 // Test the validation logic
 func TestValidate(t *testing.T) {
 	mkDefaultConfig := func() *Config {
 		c := NewDefault()
-		c.ApiServer.SkipInterface = true
+		c.ApiServer.SkipInterface = false
 		return c
 	}
 
@@ -339,6 +554,252 @@ func TestValidate(t *testing.T) {
 				return c
 			}(),
 			expectErr: false,
+		},
+		{
+			name: "advertise-address-not-present",
+			config: func() *Config {
+				c := mkDefaultConfig()
+				c.ApiServer.AdvertiseAddress = "8.8.8.8"
+				c.ApiServer.SkipInterface = true
+				return c
+			}(),
+			expectErr: true,
+		},
+		{
+			name: "router-status-invalid",
+			config: func() *Config {
+				c := mkDefaultConfig()
+				c.Ingress.Status = "invalid"
+				return c
+			}(),
+			expectErr: true,
+		},
+		{
+			name: "ingress-ports-http-invalid-value-1",
+			config: func() *Config {
+				c := mkDefaultConfig()
+				c.Ingress.Ports.Http = ptr.To[int](0)
+				return c
+			}(),
+			expectErr: true,
+		},
+		{
+			name: "ingress-listen-address-ip-forbidden",
+			config: func() *Config {
+				c := mkDefaultConfig()
+				c.Ingress.ListenAddress = []string{"127.0.0.1", "169.255.169.254"}
+				return c
+			}(),
+			expectErr: true,
+		},
+		{
+			name: "ingress-ports-http-invalid-value-2",
+			config: func() *Config {
+				c := mkDefaultConfig()
+				c.Ingress.Ports.Http = ptr.To[int](65536)
+				return c
+			}(),
+			expectErr: true,
+		},
+		{
+			name: "ingress-listen-address-ip-not-present",
+			config: func() *Config {
+				c := mkDefaultConfig()
+				c.Ingress.ListenAddress = []string{"1.2.3.4"}
+				return c
+			}(),
+			expectErr: true,
+		},
+		{
+			name: "ingress-ports-https-invalid-value-1",
+			config: func() *Config {
+				c := mkDefaultConfig()
+				c.Ingress.Ports.Https = ptr.To[int](0)
+				return c
+			}(),
+			expectErr: true,
+		},
+		{
+			name: "ingress-ports-https-invalid-value-2",
+			config: func() *Config {
+				c := mkDefaultConfig()
+				c.Ingress.Ports.Https = ptr.To[int](65536)
+				return c
+			}(),
+			expectErr: true,
+		},
+		{
+			name: "ingress-listen-address-nic-not-present",
+			config: func() *Config {
+				c := mkDefaultConfig()
+				c.Ingress.ListenAddress = []string{"dummyinterface"}
+				return c
+			}(),
+			expectErr: true,
+		},
+		{
+			name: "ingress-listen-address-bad-ip-family-1",
+			config: func() *Config {
+				c := mkDefaultConfig()
+				c.Ingress.ListenAddress = []string{"1.2.3.4"}
+				c.Network.ClusterNetwork = []string{"fd01::/48"}
+				c.Network.ServiceNetwork = []string{"fd02::/112"}
+				return c
+			}(),
+			expectErr: true,
+		},
+		{
+			name: "ingress-listen-address-bad-ip-family-2",
+			config: func() *Config {
+				c := mkDefaultConfig()
+				c.Ingress.ListenAddress = []string{"fe80::1"}
+				c.Network.ClusterNetwork = []string{"10.42.0.0/16"}
+				c.Network.ServiceNetwork = []string{"10.43.0.0/16"}
+				return c
+			}(),
+			expectErr: true,
+		},
+		{
+			name: "audit-log-flag-values-unexpected-values",
+			config: func() *Config {
+				c := mkDefaultConfig()
+				c.ApiServer.AuditLog.MaxFiles = -1
+				c.ApiServer.AuditLog.MaxFileAge = -1
+				c.ApiServer.AuditLog.MaxFileSize = -1
+				return c
+			}(),
+			expectErr: true,
+		},
+		{
+			name: "audit-log-flag-expected-values",
+			config: func() *Config {
+				c := mkDefaultConfig()
+				c.ApiServer.AuditLog.MaxFiles = 0
+				c.ApiServer.AuditLog.MaxFileAge = 0
+				c.ApiServer.AuditLog.MaxFileSize = 0
+				return c
+			}(),
+			expectErr: false,
+		},
+		{
+			name: "network-too-many-entries",
+			config: func() *Config {
+				c := mkDefaultConfig()
+				c.Network.ServiceNetwork = []string{"1.2.3.4/24", "::1/128", "5.6.7.8/24"}
+				c.Network.ClusterNetwork = []string{"9.10.11.12/24", "::2/128", "13.14.15.16/24"}
+				c.ApiServer.AdvertiseAddress = "17.18.19.20"
+				return c
+			}(),
+			expectErr: true,
+		},
+		{
+			name: "network-same-ip-family-ipv4",
+			config: func() *Config {
+				c := mkDefaultConfig()
+				c.Network.ServiceNetwork = []string{"21.22.23.24/24", "25.26.27.28/24"}
+				c.Network.ClusterNetwork = []string{"29.30.31.32/24", "33.34.35.36/24"}
+				c.ApiServer.AdvertiseAddress = "37.38.39.40"
+				return c
+			}(),
+			expectErr: true,
+		},
+		{
+			name: "network-same-ip-family-ipv6",
+			config: func() *Config {
+				c := mkDefaultConfig()
+				c.Network.ServiceNetwork = []string{"fd01::/64", "fd02::/64"}
+				c.Network.ClusterNetwork = []string{"fd03::/64", "fd04::/64"}
+				c.ApiServer.AdvertiseAddress = "fd01::1"
+				return c
+			}(),
+			expectErr: true,
+		},
+		{
+			name: "network-bad-format-ipv4",
+			config: func() *Config {
+				c := mkDefaultConfig()
+				c.Network.ServiceNetwork = []string{"1.2.3.300/24"}
+				c.Network.ClusterNetwork = []string{"300.1.2.3/24"}
+				c.ApiServer.AdvertiseAddress = "8.8.8.8"
+				return c
+			}(),
+			expectErr: true,
+		},
+		{
+			name: "network-bad-format-ipv6",
+			config: func() *Config {
+				c := mkDefaultConfig()
+				c.Network.ServiceNetwork = []string{"fd01:::/64"}
+				c.Network.ClusterNetwork = []string{"fd05::/64"}
+				c.ApiServer.AdvertiseAddress = "fd01::2"
+				return c
+			}(),
+			expectErr: true,
+		},
+		{
+			name: "network-different-ip-family",
+			config: func() *Config {
+				c := mkDefaultConfig()
+				c.Network.ServiceNetwork = []string{"fd05::/64"}
+				c.Network.ClusterNetwork = []string{"4.3.2.1/24"}
+				c.ApiServer.AdvertiseAddress = "fd01::3"
+				return c
+			}(),
+			expectErr: true,
+		},
+		{
+			name: "network-different-ip-family-advertise-address",
+			config: func() *Config {
+				c := mkDefaultConfig()
+				c.Network.ServiceNetwork = []string{"fd06::/64"}
+				c.Network.ClusterNetwork = []string{"fd07::/64"}
+				c.ApiServer.AdvertiseAddress = "10.20.30.40"
+				return c
+			}(),
+			expectErr: true,
+		},
+		{
+			name: "node-ipv6-must-be-configured",
+			config: func() *Config {
+				c := mkDefaultConfig()
+				c.Network.ServiceNetwork = []string{"90.80.70.60/16", "fd08::/64"}
+				c.Network.ClusterNetwork = []string{"50.40.30.20/16", "fd09::/64"}
+				return c
+			}(),
+			expectErr: true,
+		},
+		{
+			name: "node-ipv6-must-not-be-configured",
+			config: func() *Config {
+				c := mkDefaultConfig()
+				c.Network.ServiceNetwork = []string{"91.81.71.61/16"}
+				c.Network.ClusterNetwork = []string{"51.41.31.21/16"}
+				c.Node.NodeIPV6 = "2001:db0:ff::1"
+				return c
+			}(),
+			expectErr: true,
+		},
+		{
+			name: "node-ipv6-bad-format",
+			config: func() *Config {
+				c := mkDefaultConfig()
+				c.Network.ServiceNetwork = []string{"92.82.72.62/16", "fd0a::/64"}
+				c.Network.ClusterNetwork = []string{"52.42.32.22/16", "fd0b::/64"}
+				c.Node.NodeIPV6 = "2001:db0::ff:::1"
+				return c
+			}(),
+			expectErr: true,
+		},
+		{
+			name: "node-ipv6-must-be-ipv6",
+			config: func() *Config {
+				c := mkDefaultConfig()
+				c.Network.ServiceNetwork = []string{"93.83.73.63/16", "fd0c::/64"}
+				c.Network.ClusterNetwork = []string{"53.43.33.23/16", "fd0d::/64"}
+				c.Node.NodeIPV6 = "11.22.33.44"
+				return c
+			}(),
+			expectErr: true,
 		},
 	}
 	for _, tt := range ttests {

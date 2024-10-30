@@ -49,11 +49,11 @@ _install() {
     mv "${WORK_DIR}/${initial_filename}" "${dest}"
 }
 
-get_golangci-lint() {
-    local ver="1.52.1"
+gettool_golangci-lint() {
+    local ver="1.55.2"
     declare -A checksums=(
-        ["x86_64"]="f31a6dc278aff92843acdc2671f17c753c6e2cb374d573c336479e92daed161f"
-        ["aarch64"]="30dbea4ddde140010981b491740b4dd9ba973ce53a1a2f447a5d57053efe51cf")
+        ["x86_64"]="ca21c961a33be3bc15e4292dc40c98c8dcc5463a7b6768a3afc123761630c09c"
+        ["aarch64"]="8eb0cee9b1dbf0eaa49871798c7f8a5b35f2960c52d776a5f31eb7d886b92746")
 
     declare -A arch_map=(
         ["x86_64"]="amd64"
@@ -68,7 +68,7 @@ get_golangci-lint() {
     _install "${url}" "${checksum}" "${filename}" "${filename}"
 }
 
-get_shellcheck() {
+gettool_shellcheck() {
     local ver="v0.9.0"
     declare -A checksums=(
         ["x86_64"]="700324c6dd0ebea0117591c6cc9d7350d9c7c5c287acbad7630fa17b1d4d9e2f"
@@ -86,7 +86,7 @@ get_shellcheck() {
     _install "${url}" "${checksum}" "${filename}" "${filename}"
 }
 
-get_kuttl() {
+gettool_kuttl() {
     local ver="0.15.0"
     declare -A checksums=(
         ["x86_64"]="f6edcf22e238fc71b5aa389ade37a9efce596017c90f6994141c45215ba0f862"
@@ -104,11 +104,11 @@ get_kuttl() {
     _install "${url}" "${checksum}" "${filename}" "kubectl-kuttl_${ver}_linux_${arch}"
 }
 
-get_yq() {
-    local ver="4.26.1"
+gettool_yq() {
+    local ver="4.44.2"
     declare -A checksums=(
-        ["x86_64"]="4d3afe5ddf170ac7e70f4c23eea2969eca357947b56d5d96b8516bdf9ce56577"
-        ["aarch64"]="837a659c5a04599f3ee7300b85bf6ccabdfd7ce39f5222de27281e0ea5bcc477")
+        ["x86_64"]="e4c2570249e3993e33ffa44e592b5eee8545bd807bfbeb596c2986d86cb6c85c"
+        ["aarch64"]="79c22d98b2ff517cb8b1c20499350cbc1e8c753483c8f72a37a299e6e9872a98")
 
     declare -A arch_map=(
         ["x86_64"]="amd64"
@@ -122,51 +122,32 @@ get_yq() {
     _install "${url}" "${checksum}" "${filename}" "yq_linux_${arch}"
 }
 
-get_hadolint() {
-    local ver="2.12.0"
-    declare -A checksums=(
-        ["x86_64"]="56de6d5e5ec427e17b74fa48d51271c7fc0d61244bf5c90e828aab8362d55010"
-        ["aarch64"]="5798551bf19f33951881f15eb238f90aef023f11e7ec7e9f4c37961cb87c5df6")
+gettool_hadolint() {
+    local -r ver="2.12.0"
+    local -r img="ghcr.io/hadolint/hadolint"
 
-    declare -A arch_map=(
-        ["x86_64"]="x86_64"
-        ["aarch64"]="arm64")
-
-    local arch="${arch_map[${ARCH}]}"
-    local checksum="${checksums[${ARCH}]}"
-    local filename="hadolint"
-    local url="https://github.com/hadolint/hadolint/releases/download/v${ver}/hadolint-Linux-${arch}"
-
-    _install "${url}" "${checksum}" "${filename}" "hadolint-Linux-${arch}"
-
-    # SELinux context change is required on some systems to prevent the following error
-    #
-    # SELinux is preventing <exename> from execmod access on the file.
-    # If you want to allow all unconfined executables to use libraries requiring text relocation
-    # that are not labeled textrel_shlib_t, then you must tell SELinux about this by enabling the
-    # 'selinuxuser_execmod' boolean.
-    if selinuxenabled ; then
-        chcon -t textrel_shlib_t "${DEST_DIR}/${filename}"
+    if [ "$(podman images -q "${img}:${ver}" | wc -w)" -eq 0 ] ; then
+        podman pull "${img}:${ver}"
     fi
 }
 
-get_lichen() {
+gettool_lichen() {
     local ver="v0.1.7"
     GOBIN=${DEST_DIR} GOFLAGS="" go install github.com/uw-labs/lichen@${ver}
 }
 
-get_govulncheck() {
+gettool_govulncheck() {
     # Must use latest to get up-to-date vulnerability checks
     local ver="latest"
     GOBIN=${DEST_DIR} GOFLAGS="" go install -mod=mod golang.org/x/vuln/cmd/govulncheck@${ver}
 }
 
-get_controller-gen() {
-    local ver="v0.11.3"
+gettool_controller-gen() {
+    local ver="v0.15.0"
     GOBIN=${DEST_DIR} GOFLAGS="" go install sigs.k8s.io/controller-tools/cmd/controller-gen@${ver}
 }
 
-get_gomplate() {
+gettool_gomplate() {
     local ver="v3.11.5"
     declare -A checksums=(
         ["x86_64"]="16f6a01a0ff22cae1302980c42ce4f98ca20f8c55443ce5a8e62e37fc23487b3"
@@ -184,7 +165,7 @@ get_gomplate() {
     _install "${url}" "${checksum}" "${filename}" "gomplate_linux-${arch}"
 }
 
-get_robotframework() {
+gettool_robotframework() {
     local venv
 
     if [ "${DEST_DIR}" = "${DEFAULT_DEST_DIR}" ]; then
@@ -203,7 +184,35 @@ get_robotframework() {
     fi
 }
 
-tool_getters=$(declare -F |  cut -d' ' -f3 | grep "get_" | sed 's/get_//g')
+gettool_awscli() {
+    # Download AWS CLI
+    pushd "${WORK_DIR}" &>/dev/null
+
+    curl -s "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "awscliv2.zip" && \
+        unzip -q awscliv2.zip
+    ./aws/install --update --install-dir "$(realpath "${DEST_DIR}/../awscli")" --bin-dir "${DEST_DIR}"
+
+    popd &>/dev/null
+}
+
+gettool_oc() {
+    declare -A arch_map=(
+        ["x86_64"]="x86_64"
+        ["aarch64"]="arm64")
+
+    local arch="${arch_map[${ARCH}]}"
+
+    pushd "${WORK_DIR}" &>/dev/null
+
+    curl -s -f "https://mirror.openshift.com/pub/openshift-v4/${arch}/clients/ocp/latest/openshift-client-linux.tar.gz" -L -o "openshift-client-linux.tar.gz"
+    tar xvzf openshift-client-linux.tar.gz
+    sudo cp oc /usr/bin/oc
+    sudo cp kubectl /usr/bin/kubectl
+
+    popd &>/dev/null
+}
+
+tool_getters=$(declare -F | awk '$3 ~ /^gettool_/ {print $3}' | sed 's/^gettool_//g')
 
 usage() {
     local msg="${1:-}"
@@ -226,11 +235,11 @@ usage() {
 [ $# -eq 0 ] && usage "Expected at least one argument"
 
 tools_to_install=()
-if echo "$@" | grep -q all; then
+if grep -qw all <<<"$@"; then
     readarray -t tools_to_install <<<"${tool_getters}"
 else
     for arg in "$@"; do
-        if ! echo "${tool_getters}" | grep -q "${arg}" || [ "$(echo "${tool_getters}" | grep "${arg}")" != "${arg}" ]; then
+        if ! grep -wq "${arg}" <<<"${tool_getters}" ; then
             usage "Unknown tool: \"${arg}\""
         fi
         tools_to_install+=("${arg}")
@@ -238,5 +247,5 @@ else
 fi
 
 for f in "${tools_to_install[@]}"; do
-    "get_${f}"
+    "gettool_${f}"
 done

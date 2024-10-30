@@ -20,6 +20,7 @@ spec:
     metadata:
       annotations:
         target.workload.openshift.io/management: '{"effect": "PreferredDuringScheduling"}'
+        openshift.io/required-scc: restricted-v2
       labels:
         app: csi-snapshot-controller
     spec:
@@ -46,7 +47,8 @@ spec:
               # TODO: measure on a real cluster
               cpu: 10m
               memory: 50Mi
-              # volumeMount with guest Kubeconfig will be added by the operator
+          terminationMessagePolicy: FallbackToLogsOnError
+          # volumeMount with guest Kubeconfig will be added by the operator
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:

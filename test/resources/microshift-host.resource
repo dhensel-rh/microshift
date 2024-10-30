@@ -23,9 +23,9 @@ Login MicroShift Host
     # login to the host. Otherwise assume that the ssh agent is running
     # and configured properly.
     IF    '${SSH_PRIV_KEY}'
-        SSHLibrary.Login With Public Key    ${USHIFT_USER}    ${SSH_PRIV_KEY}
+        SSHLibrary.Login With Public Key    ${USHIFT_USER}    ${SSH_PRIV_KEY}    keep_alive_interval=30
     ELSE
-        SSHLibrary.Login    ${USHIFT_USER}    allow_agent=True
+        SSHLibrary.Login    ${USHIFT_USER}    allow_agent=True    keep_alive_interval=30
     END
 
 Logout MicroShift Host
@@ -57,7 +57,7 @@ Reboot MicroShift Host
     Sleep    30s
 
     Wait Until Keyword Succeeds    5m    15s
-    ...    Is System Rebooted    ${bootid}
+    ...    System Should Be Rebooted    ${bootid}
 
 Create Thin Storage Pool
     [Documentation]    Create a new thin storage pool
@@ -73,12 +73,34 @@ Delete Thin Storage Pool
     Log    ${stderr}
     Should Be Equal As Integers    0    ${rc}
 
+Is System Bootc
+    [Documentation]    Returns true if system is bootc-based.
+
+    ${stdout}    ${stderr}    ${rc}=    SSHLibrary.Execute Command
+    ...    bootc status --booted --json
+    ...    sudo=True    return_stderr=True    return_stdout=True    return_rc=True
+    IF    ${rc} != 0    RETURN    ${FALSE}
+
+    ${json_status}=    Json Parse    ${stdout}
+    ${bootc_type}=    Set Variable    ${json_status}[status][type]
+    IF    '${bootc_type}' == 'bootcHost'
+        RETURN    ${TRUE}
+    ELSE
+        RETURN    ${FALSE}
+    END
+
 Is System OSTree
     [Documentation]    Returns true if system is ostree-based.
 
     ${rc}=    Execute Command    stat /run/ostree-booted
     ...    sudo=True    return_stderr=False    return_stdout=False    return_rc=True
     IF    ${rc} == 0    RETURN    ${TRUE}    ELSE    RETURN    ${FALSE}
+
+System Should Be Rebooted
+    [Documentation]    Assert if the system rebooted comparing the current and provided boot identifier
+    [Arguments]    ${old_bootid}
+    ${rebooted}=    Is System Rebooted    ${old_bootid}
+    Should Be True    ${rebooted}
 
 Is System Rebooted
     [Documentation]    Check if the system rebooted comparing the current and provided boot identifier
@@ -109,3 +131,27 @@ Change Hostname
     Should Be Equal As Integers    0    ${rc}
 
     RETURN    ${old_hostname}
+
+Command Should Work
+    [Documentation]    Run a command remotely, log stderr, fail if RC is not 0, return stdout
+    [Arguments]    ${command}
+    ${stdout}    ${stderr}    ${rc}=    SSHLibrary.Execute Command
+    ...    ${command}
+    ...    sudo=True
+    ...    return_rc=True
+    ...    return_stderr=True
+    ...    return_stdout=True
+    Log    ${stderr}
+    Should Be Equal As Integers    0    ${rc}
+    RETURN    ${stdout}
+
+Command Should Fail
+    [Documentation]    Run a command remotely, expect command to fail
+    [Arguments]    ${command}
+    ${stdout}    ${stderr}    ${rc}=    SSHLibrary.Execute Command
+    ...    ${command}
+    ...    sudo=True
+    ...    return_rc=True
+    ...    return_stderr=True
+    ...    return_stdout=True
+    Should Not Be Equal As Integers    0    ${rc}

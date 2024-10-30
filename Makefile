@@ -29,6 +29,7 @@ PATCH := $(shell echo $(SOURCE_GIT_TAG) | awk -F'[._~-]' '{print $$3}')
 
 SRC_ROOT :=$(shell pwd)
 
+WITH_FLANNEL ?= 0
 OUTPUT_DIR :=_output
 RPM_BUILD_DIR :=$(OUTPUT_DIR)/rpmbuild
 ISO_DIR :=$(OUTPUT_DIR)/image-builder
@@ -56,6 +57,8 @@ GO_PACKAGES=$(go list ./cmd/... ./pkg/...)
 
 # Build to a place we can ignore
 GO_BUILD_BINDIR :=$(OUTPUT_DIR)/bin
+
+GO_CACHE :=$(shell go env GOCACHE)
 
 ifeq ($(DEBUG),true)
 	# throw all the debug info in!
@@ -99,8 +102,7 @@ debug:
 	@echo MINOR:"$(MINOR)"
 	@echo PATCH:"$(PATCH)"
 
-# These tags make sure we can statically link and avoid shared dependencies
-GO_BUILD_FLAGS :=-tags 'include_gcs include_oss containers_image_openpgp gssapi providerless netcgo osusergo'
+GO_BUILD_FLAGS :=-tags 'include_gcs include_oss containers_image_openpgp gssapi providerless netcgo osusergo strictfipsruntime'
 
 # Set variables for test-unit target
 GO_TEST_FLAGS=$(GO_BUILD_FLAGS)
@@ -109,6 +111,9 @@ GO_TEST_PACKAGES=./cmd/... ./pkg/...
 # Enable CGO when building microshift binary for access to local libraries.
 # Use an environment variable to allow CI to disable when cross-compiling.
 export CGO_ENABLED ?= 1
+
+# Specify OCP build tools image tag when building rpm with podman
+RPM_BUILDER_IMAGE_TAG := rhel-9-golang-1.22-builder-multi-openshift-4.17
 
 all: generate-config microshift etcd
 
@@ -180,10 +185,19 @@ verify-py:
 verify-rf:
 	./scripts/verify/verify-rf.sh
 
+# When run inside a container, the file contents are redirected via stdin and
+# the output of errors does not contain the file path. Work around this issue
+# by replacing the '^-:' token in the output by the actual file name.
 .PHONY: verify-containers
 verify-containers:
-	./scripts/fetch_tools.sh hadolint && \
-	./_output/bin/hadolint $$(find . -iname 'Containerfile*' -o -iname 'Dockerfile*'| grep -v "vendor\|_output\|origin")
+	./scripts/fetch_tools.sh hadolint ; \
+	FILES=$$(find . -iname '*containerfile*' -o -iname '*dockerfile*' | grep -v "vendor\|_output\|origin\|.git") ; \
+	for f in $${FILES} ; do \
+		echo "$${f}" ; \
+		podman run --rm -i \
+			-v "$$(pwd)/.hadolint.yaml:/.hadolint.yaml:ro" \
+			ghcr.io/hadolint/hadolint:2.12.0 < "$${f}" | sed "s|^-:|$${f}:|" ; \
+	done
 
 # Vulnerability check is not run in any default verify target
 # It should be run explicitly before the release to track and fix known vulnerabilities
@@ -223,6 +237,15 @@ validate-cluster:
 OS := $(shell go env GOOS)
 ARCH := $(shell go env GOARCH)
 
+
+# check if FIPS supported
+ifeq (, $(shell go doc goexperiment.Flags | grep -i strictfipsruntime))
+	GOEXPERIMENT =
+else
+	GOEXPERIMENT = "strictfipsruntime"
+endif
+
+
 ###############################
 # host build targets          #
 ###############################
@@ -241,6 +264,7 @@ _build_local:
                    -X main.gitTreeState=$(EMBEDDED_GIT_TREE_STATE) \
                    -X main.buildDate=$(BIN_TIMESTAMP) \
 					$(LD_FLAGS)\"" \
+					GOEXPERIMENT=${GOEXPERIMENT} \
 		$(MAKE) -C etcd --no-print-directory build \
 			GO_BUILD_PACKAGES:=./cmd/microshift-etcd \
 			GO_BUILD_BINDIR:=../$(CROSS_BUILD_BINDIR)/$(GOOS)_$(GOARCH)
@@ -263,6 +287,7 @@ rpm:
 	SOURCE_GIT_TAG=${SOURCE_GIT_TAG} \
 	SOURCE_GIT_COMMIT=${SOURCE_GIT_COMMIT} \
 	SOURCE_GIT_TREE_STATE=${SOURCE_GIT_TREE_STATE} \
+	WITH_FLANNEL=${WITH_FLANNEL} \
 	./packaging/rpm/make-rpm.sh rpm local
 .PHONY: rpm
 
@@ -272,6 +297,7 @@ srpm:
 	SOURCE_GIT_TAG=${SOURCE_GIT_TAG} \
 	SOURCE_GIT_COMMIT=${SOURCE_GIT_COMMIT} \
 	SOURCE_GIT_TREE_STATE=${SOURCE_GIT_TREE_STATE} \
+	WITH_FLANNEL=${WITH_FLANNEL} \
 	./packaging/rpm/make-rpm.sh srpm local
 .PHONY: srpm
 
@@ -293,18 +319,23 @@ commit: image-build-configure image-build-commit
 .PHONY: commit
 
 rpm-podman:
-	RPM_BUILDER_IMAGE_TAG="rhel-8-release-golang-1.19-openshift-4.13"; \
 	podman build \
 		--volume /etc/pki/entitlement/:/etc/pki/entitlement \
-		--build-arg TAG=$$RPM_BUILDER_IMAGE_TAG \
-		--tag microshift-builder:$$RPM_BUILDER_IMAGE_TAG - < ./packaging/images/Containerfile.rpm-builder ; \
+		--build-arg TAG=$(RPM_BUILDER_IMAGE_TAG) \
+		--build-arg DNF=dnf.real \
+		--authfile $(PULLSECRET) \
+		--tag microshift-builder:$(RPM_BUILDER_IMAGE_TAG) \
+		--file ./packaging/images/Containerfile.rpm-builder \
+	&& \
 	podman run \
-		--rm -ti \
-		--volume $$(pwd):/opt/microshift \
-		--volume $$(go env GOCACHE):/go/.cache \
+		--rm -i \
+		--volume $$(pwd):/opt/microshift:z \
 		--env TARGET_ARCH=$(TARGET_ARCH) \
-		microshift-builder:$$RPM_BUILDER_IMAGE_TAG \
-		bash -ilc 'cd /opt/microshift && make rpm & pid=$$! ; trap "pkill $${pid}" INT ; wait $${pid}'
+		--env WITH_FLANNEL=$(WITH_FLANNEL) \
+		microshift-builder:$(RPM_BUILDER_IMAGE_TAG) \
+		bash -ilc 'cd /opt/microshift && make rpm & pid=$$! ; \
+				   trap "echo Killing make PID $${pid}; kill $${pid}" INT ; \
+				   wait $${pid}'
 .PHONY: rpm-podman
 
 ###############################

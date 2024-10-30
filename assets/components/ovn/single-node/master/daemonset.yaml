@@ -29,6 +29,7 @@ spec:
         type: infra
         openshift.io/component: network
         kubernetes.io/os: "linux"
+        microshift.io/ipfamilypolicy: '{{.IPFamily}}'
     spec:
       serviceAccountName: ovn-kubernetes-controller
       hostNetwork: true
@@ -193,16 +194,6 @@ spec:
                 /usr/share/ovn/scripts/ovn-ctl stop_nb_ovsdb
                 echo "$(date -Iseconds) - nbdb stopped"
                 rm -f /var/run/ovn/ovnnb_db.pid
-        readinessProbe:
-          timeoutSeconds: 5
-          exec:
-            command:
-            - /bin/bash
-            - -c
-            - |
-              set -xeo pipefail
-              /usr/bin/ovn-appctl -t /var/run/ovn/ovnnb_db.ctl --timeout=5 ovsdb-server/memory-trim-on-compaction on 2>/dev/null
-
         env:
         - name: OVN_LOG_LEVEL
           value: info
@@ -288,15 +279,6 @@ spec:
                 /usr/share/ovn/scripts/ovn-ctl stop_sb_ovsdb
                 echo "$(date -Iseconds) - sbdb stopped"
                 rm -f /var/run/ovn/ovnsb_db.pid
-        readinessProbe:
-          timeoutSeconds: 5
-          exec:
-            command:
-            - /bin/bash
-            - -c
-            - |
-              set -xeo pipefail
-              /usr/bin/ovn-appctl -t /var/run/ovn/ovnsb_db.ctl --timeout=5 ovsdb-server/memory-trim-on-compaction on 2>/dev/null
         env:
         - name: OVN_LOG_LEVEL
           value: info
@@ -343,6 +325,8 @@ spec:
           gateway_mode_flags="--gateway-mode local --gateway-interface br-ex"
 
           sysctl net.ipv4.ip_forward=1
+          sysctl net.ipv6.conf.all.forwarding=1
+          sysctl net.ipv6.conf.default.forwarding=1
 
           gw_interface_flag=
           # if br-ex1 is configured on the node, we want to use it for external gateway traffic
@@ -470,7 +454,7 @@ spec:
           path: "/etc/cni/net.d"
       - name: host-cni-bin
         hostPath:
-          path: "/opt/cni/bin"
+          path: "/run/cni/bin"
 
       - name: kubeconfig
         hostPath:

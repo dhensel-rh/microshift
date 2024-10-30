@@ -1,24 +1,24 @@
 approvers:
 - copejon
-- dhellmann
 - ggiguash
-- zshi-redhat
 - pmtk
 - pacevedom
-- pliurh
-- eggfoobar
 - jerpeter1
 - jogeo
 - eslutsky
+- dhensel-rh
+- agullon
 reviewers:
 - copejon
-- dhellmann
 - ggiguash
 - pmtk
 - pacevedom
-- pliurh
 - jerpeter1
 - jogeo
+- eslutsky
+- dhensel-rh
+- agullon
+- vanhalenar
 emeritus_approvers:
 - cooktheryan
 - husky-parul
@@ -29,3 +29,7 @@ emeritus_approvers:
 - mangelajo
 - oglok
 - fzdarsky
+- dhellmann
+- zshi-redhat
+- pliurh
+- eggfoobar

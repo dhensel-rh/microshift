@@ -28,6 +28,8 @@ type versionFile struct {
 	BootID       string          `json:"boot_id"`
 }
 
+const MAX_VERSION_SKEW = 2
+
 func (hi *versionFile) BackupName() data.BackupName {
 	return data.BackupName(fmt.Sprintf("%s_%s", hi.DeploymentID, hi.BootID))
 }
@@ -87,7 +89,7 @@ type versions struct {
 // getVersions obtains and returns versions of executable and data dir.
 // Version of data will be nil if the MicroShift data does not exist yet.
 func getVersions() (versions, error) {
-	execVer, err := getVersionOfExecutable()
+	execVer, err := GetVersionOfExecutable()
 	if err != nil {
 		return versions{}, fmt.Errorf("failed to get version of MicroShift executable: %w", err)
 	}
@@ -134,7 +136,7 @@ func updateVersionFile(ver versionMetadata) error {
 	if err != nil {
 		return fmt.Errorf("failed to check if system is ostree: %w", err)
 	} else if isOstree {
-		currentDeploymentID, err = getCurrentDeploymentID()
+		currentDeploymentID, err = GetCurrentDeploymentID()
 		if err != nil {
 			return fmt.Errorf("failed to get current deployment ID: %w", err)
 		}
@@ -229,7 +231,7 @@ func versionMetadataFromString(majorMinorPatch string) (versionMetadata, error) 
 	return versionMetadata{Major: major, Minor: minor, Patch: patch}, nil
 }
 
-func getVersionOfExecutable() (versionMetadata, error) {
+func GetVersionOfExecutable() (versionMetadata, error) {
 	ver := version.Get()
 	return versionMetadataFromString(fmt.Sprintf("%s.%s.%s", ver.Major, ver.Minor, ver.Patch))
 }
@@ -317,12 +319,13 @@ func checkVersionCompatibility(execVer, dataVer versionMetadata) error {
 	}
 
 	if execVer.Minor > dataVer.Minor {
-		if execVer.Minor-1 == dataVer.Minor {
-			klog.InfoS("Executable is newer than data by 1 - continuing")
+		versionSkew := execVer.Minor - dataVer.Minor
+		if versionSkew <= MAX_VERSION_SKEW {
+			klog.Infof("Executable is newer than data by %d minor versions, continuing", versionSkew)
 			return nil
 		} else {
-			return fmt.Errorf("executable (%s) is too recent compared to existing data (%s): version difference is %d, maximum allowed difference is 1",
-				execVer.String(), dataVer.String(), execVer.Minor-dataVer.Minor)
+			return fmt.Errorf("executable (%s) is too recent compared to existing data (%s): minor version difference is %d, maximum allowed difference is %d",
+				execVer.String(), dataVer.String(), versionSkew, MAX_VERSION_SKEW)
 		}
 	}
 

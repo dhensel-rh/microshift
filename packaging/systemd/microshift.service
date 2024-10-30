@@ -21,7 +21,8 @@ CPUAccounting=yes
 BlockIOAccounting=yes
 MemoryAccounting=yes
 LimitNOFILE=1048576
-TimeoutStartSec=2m
+TimeoutStartSec=4m
 
 [Install]
 WantedBy=multi-user.target
+Also=microshift-cleanup-kubelet.service

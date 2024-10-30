@@ -14,13 +14,21 @@ clean_podman_images() {
         return
     fi
 
-    title "Cleaning up container images"
-    for id in $(sudo podman ps -a | grep microshift | awk '{print $1}') ; do
+    title "Cleaning up running containers"
+    for id in $(sudo podman ps -a | awk '{print $1}') ; do
         sudo podman rm -f "${id}"
+    done
+    for id in $(podman ps -a | awk '{print $1}') ; do
+        podman rm -f "${id}"
     done
 
     if [ "${FULL_CLEAN}" = 1 ] ; then
+        title "Cleaning up container images"
+
         sudo podman rmi -af
+        podman rmi -af
+        # Ensure the user-specific container storage is deleted
+        sudo rm -rf ~/.local/share/containers/
     fi
 }
 
@@ -46,7 +54,7 @@ clean_composer_jobs() {
         done
 
         title "Cleaning up composer sources"
-        for src in $(sudo composer-cli sources list | grep -Ev "appstream|baseos") ; do
+        for src in $(sudo composer-cli sources list | grep -Ev "appstream|baseos|kernel-rt") ; do
             echo "Removing source ${src}"
             sudo composer-cli sources delete "${src}"
         done
@@ -59,15 +67,17 @@ clean_osbuilder_services() {
     fi
 
     title "Stopping osbuild services"
-    sudo systemctl stop --now osbuild-composer.socket osbuild-composer.service
     for n in $(seq 100) ; do
         worker=osbuild-worker@${n}.service
         if sudo systemctl status "${worker}" &>/dev/null ; then
-            sudo systemctl stop --now "osbuild-worker@${n}.service"
+            sudo systemctl stop "osbuild-worker@${n}.service"
         else
             break
         fi
     done
+    # Don't stop the .socket as it can cause composer.service to fail
+    # stopping resulting in failed restarts which cause problem starting later.
+    sudo systemctl stop osbuild-composer.service
 
     title "Cleaning osbuild worker cache"
     sleep 5
@@ -79,10 +89,12 @@ restart_osbuilder_services() {
         return
     fi
 
-    if ! systemctl is-active -q osbuild-composer.socket &>/dev/null ; then
+    if ! systemctl is-active -q osbuild-composer.service &>/dev/null ; then
         title "Starting osbuild services"
-        sudo systemctl start osbuild-composer.socket
         sudo systemctl start osbuild-worker@1.service
+        # Thanks to osbuild-composer.socket, starting worker should be enough
+        # to start the composer, but left it just in case.
+        sudo systemctl start osbuild-composer.service
     fi
 }
 

@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/openshift/library-go/pkg/crypto"
 	"github.com/openshift/microshift/pkg/config"
 	"github.com/openshift/microshift/pkg/util"
 
@@ -53,11 +54,13 @@ func (s *KubeScheduler) configure(cfg *config.Config) {
 	s.options.ConfigFile = filepath.Join(config.DataDir, "/resources/kube-scheduler/config/config.yaml")
 	s.options.Authentication.RemoteKubeConfigFile = cfg.KubeConfigPath(config.KubeScheduler)
 	s.options.Authorization.RemoteKubeConfigFile = cfg.KubeConfigPath(config.KubeScheduler)
+	s.options.SecureServing.MinTLSVersion = string(fixedTLSProfile.MinTLSVersion)
+	s.options.SecureServing.CipherSuites = crypto.OpenSSLToIANACipherSuites(fixedTLSProfile.Ciphers)
 	s.kubeconfig = cfg.KubeConfigPath(config.KubeScheduler)
 }
 
 func (s *KubeScheduler) writeConfig(cfg *config.Config) error {
-	data := []byte(`apiVersion: kubescheduler.config.k8s.io/v1beta3
+	data := []byte(`apiVersion: kubescheduler.config.k8s.io/v1
 kind: KubeSchedulerConfiguration
 clientConnection:
   kubeconfig: ` + cfg.KubeConfigPath(config.KubeScheduler) + `
@@ -80,7 +83,7 @@ func (s *KubeScheduler) Run(ctx context.Context, ready chan<- struct{}, stopped 
 		// This endpoint uses a self-signed certificate on purpose, we need to skip verification.
 		healthcheckStatus := util.RetryInsecureGet(ctx, "https://localhost:10259/healthz")
 		if healthcheckStatus != 200 {
-			klog.Errorf("%s healthcheck failed", s.Name(), fmt.Errorf("kube-scheduler failed to start"))
+			klog.Errorf("%s healthcheck failed due to kube-scheduler failure to start", s.Name())
 			errorChannel <- errors.New("kube-scheduler healthcheck failed")
 		}
 

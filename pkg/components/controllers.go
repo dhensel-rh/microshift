@@ -123,10 +123,28 @@ func startIngressController(ctx context.Context, cfg *config.Config, kubeconfigP
 		}
 		svc = []string{
 			"components/openshift-router/service-internal.yaml",
+			"components/openshift-router/service-cloud.yaml",
 		}
 		cm                   = "components/openshift-router/configmap.yaml"
 		servingKeypairSecret = "components/openshift-router/serving-certificate.yaml"
 	)
+
+	if cfg.Ingress.Status == config.StatusRemoved {
+		if err := assets.DeleteClusterRoleBindings(ctx, clusterRoleBinding, kubeconfigPath); err != nil {
+			klog.Warningf("Failed to delete cluster role bindings %v: %v", clusterRoleBinding, err)
+			return err
+		}
+		if err := assets.DeleteClusterRoles(ctx, clusterRole, kubeconfigPath); err != nil {
+			klog.Warningf("Failed to delete cluster roles %v: %v", clusterRole, err)
+			return err
+		}
+		if err := assets.DeleteNamespaces(ctx, ns, kubeconfigPath); err != nil {
+			klog.Warningf("Failed to delete namespaces %v: %v", ns, err)
+			return err
+		}
+		return nil
+	}
+
 	if err := assets.ApplyNamespaces(ctx, ns, kubeconfigPath); err != nil {
 		klog.Warningf("Failed to apply namespaces %v: %v", ns, err)
 		return err
@@ -158,7 +176,22 @@ func startIngressController(ctx context.Context, cfg *config.Config, kubeconfigP
 		klog.Warningf("Failed to apply configMap %v: %v", cm, err)
 		return err
 	}
-	if err := assets.ApplyServices(ctx, svc, nil, nil, kubeconfigPath); err != nil {
+
+	routerMode := "v4"
+	if cfg.IsIPv6() {
+		routerMode = "v4v6"
+		if !cfg.IsIPv4() {
+			routerMode = "v6"
+		}
+	}
+
+	extraParams := assets.RenderParams{
+		"RouterNamespaceOwnership": cfg.Ingress.AdmissionPolicy.NamespaceOwnership == config.NamespaceOwnershipAllowed,
+		"RouterHttpPort":           *cfg.Ingress.Ports.Http,
+		"RouterHttpsPort":          *cfg.Ingress.Ports.Https,
+		"RouterMode":               routerMode,
+	}
+	if err := assets.ApplyServices(ctx, svc, renderTemplate, renderParamsFromConfig(cfg, extraParams), kubeconfigPath); err != nil {
 		klog.Warningf("Failed to apply service %v %v", svc, err)
 		return err
 	}
@@ -175,7 +208,7 @@ func startIngressController(ctx context.Context, cfg *config.Config, kubeconfigP
 		return err
 	}
 
-	if err := assets.ApplyDeployments(ctx, apps, renderTemplate, renderParamsFromConfig(cfg, nil), kubeconfigPath); err != nil {
+	if err := assets.ApplyDeployments(ctx, apps, renderTemplate, renderParamsFromConfig(cfg, extraParams), kubeconfigPath); err != nil {
 		klog.Warningf("Failed to apply apps %v: %v", apps, err)
 		return err
 	}
@@ -209,7 +242,7 @@ func startDNSController(ctx context.Context, cfg *config.Config, kubeconfigPath 
 		}
 	)
 	if err := assets.ApplyNamespaces(ctx, ns, kubeconfigPath); err != nil {
-		klog.Warningf("Failed to apply", "namespace", ns, "err", err)
+		klog.Warningf("Failed to apply namespace %q due to error %v", ns, err)
 		return err
 	}
 

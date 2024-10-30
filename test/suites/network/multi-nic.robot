@@ -46,7 +46,6 @@ Verify MicroShift Runs Only On Primary NIC
     ...    change. A restart is forced so that MicroShift picks up the new
     ...    configuration (without the secondary IP) and regenerates the
     ...    certificates, which will be lacking the IP from secondary NIC.
-    [Setup]    Save Default MicroShift Config
 
     Configure Subject Alternative Name    ${USHIFT_HOST_IP1}
 
@@ -56,6 +55,7 @@ Verify MicroShift Runs Only On Primary NIC
     Disable Interface    ${NIC2_NAME}
 
     Restart MicroShift
+    Restart Greenboot And Wait For Success
 
     Verify MicroShift On Single NIC    ${USHIFT_HOST_IP1}    ${USHIFT_HOST_IP2}
 
@@ -67,7 +67,6 @@ Verify MicroShift Runs Only On Secondary NIC
     ...    an automatic restart of the service. After restarting, the node IP will
     ...    be that of the secondary NIC, and certificates will be updated according
     ...    to the new configuration (which includes only the secondary IP).
-    [Setup]    Save Default MicroShift Config
 
     Configure Subject Alternative Name    ${USHIFT_HOST_IP2}
 
@@ -157,7 +156,7 @@ Verify Hello MicroShift NodePort
     Expose Hello MicroShift Pod Via NodePort
 
     Wait Until Keyword Succeeds    30x    10s
-    ...    Access Hello Microshift    ${NP_PORT}    ${ip}
+    ...    Access Hello Microshift Success    ${NP_PORT}    ${ip}
 
     [Teardown]    Run Keywords
     ...    Delete Hello MicroShift Pod And Service
@@ -183,8 +182,7 @@ Configure Subject Alternative Name
     ...    \ \ subjectAltNames:
     ...    \ \ - ${ip}
 
-    ${replaced}=    Replace MicroShift Config    ${subject_alt_names}
-    Upload MicroShift Config    ${replaced}
+    Drop In MicroShift Config    ${subject_alt_names}    10-subjectAltNames
 
 Check IP Certificate
     [Documentation]    Checks whether the ${ip} is present in the subject
@@ -213,7 +211,7 @@ IP Should Not Be Present In External Certificate
 Restore Network Configuration By Rebooting Host
     [Documentation]    Restores network interface initial configuration
     ...    by rebooting the host.
-    Restore Default MicroShift Config
+    Remove Drop In MicroShift Config    10-subjectAltNames
     Reboot MicroShift Host
     Login Switch To IP    ${USHIFT_HOST_IP1}
     Wait Until Greenboot Health Check Exited

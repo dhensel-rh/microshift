@@ -23,10 +23,10 @@ import (
 	"net/http"
 	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
+	"github.com/vishvananda/netlink"
 	"k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
@@ -47,7 +47,7 @@ func GetHostIP(nodeIP string) (string, error) {
 			foundHardCodedNodeIP = true
 			klog.Infof("trying to find configured nodeIP %q on host", nodeIP)
 		}
-		hostIP, err = selectV4IPFromHostInterface(nodeIP)
+		hostIP, err = selectIPFromHostInterface(nodeIP)
 		if err != nil {
 			foundHardCodedNodeIP = false
 			return "", fmt.Errorf("failed to find the configured nodeIP %q on host: %v", nodeIP, err)
@@ -59,7 +59,7 @@ func GetHostIP(nodeIP string) (string, error) {
 		hostIP = ip.String()
 	} else {
 		klog.Infof("failed to get host IP by default route: %v", err)
-		if hostIP, err = selectV4IPFromHostInterface(""); err != nil {
+		if hostIP, err = selectIPFromHostInterface(""); err != nil {
 			return "", err
 		}
 	}
@@ -117,15 +117,6 @@ func RetryTCPConnection(ctx context.Context, host string, port string) bool {
 	return status
 }
 
-func CreateLocalhostListenerOnPort(port int) (tcpnet.Listener, error) {
-	ln, err := tcpnet.Listen("tcp", "0.0.0.0:"+strconv.Itoa(port))
-	if err != nil {
-		return nil, err
-	}
-
-	return ln, nil
-}
-
 func AddToNoProxyEnv(additionalEntries ...string) error {
 	entries := map[string]struct{}{}
 
@@ -168,7 +159,7 @@ func addNoProxyEnvVarEntries(entries map[string]struct{}, envVar string) {
 	}
 }
 
-func selectV4IPFromHostInterface(nodeIP string) (string, error) {
+func selectIPFromHostInterface(nodeIP string) (string, error) {
 	ifaces, err := tcpnet.Interfaces()
 	if err != nil {
 		return "", err
@@ -190,8 +181,7 @@ func selectV4IPFromHostInterface(nodeIP string) (string, error) {
 			if err != nil {
 				return "", fmt.Errorf("unable to parse CIDR for interface %q: %s", i.Name, err)
 			}
-			if ip.To4() == nil || ip.IsLoopback() {
-				// ignore IPv6 and loopback addresses
+			if ip.IsLoopback() {
 				continue
 			}
 			if nodeIP != "" && nodeIP != ip.String() {
@@ -201,4 +191,78 @@ func selectV4IPFromHostInterface(nodeIP string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no interface with valid address found on host")
+}
+
+// ContainIPANetwork - will check if given IP address contained within list of networks
+func ContainIPANetwork(ip tcpnet.IP, networks []string) bool {
+	for _, netStr := range networks {
+		_, netA, err := tcpnet.ParseCIDR(netStr)
+		if err != nil {
+			klog.Warningf("Could not parse CIDR %s, err: %v", netA, err)
+			return false
+		}
+		if netA.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func GetHostIPv6(ipHint string) (string, error) {
+	handle, err := netlink.NewHandle()
+	if err != nil {
+		return "", err
+	}
+	// Start by looking for the default route and using the dev
+	// address.
+	routeList, err := handle.RouteList(nil, netlink.FAMILY_V6)
+	if err != nil {
+		return "", err
+	}
+	defaultRouteLinkIndex := -1
+	for _, route := range routeList {
+		if route.Dst == nil {
+			defaultRouteLinkIndex = route.LinkIndex
+			break
+		}
+	}
+
+	if defaultRouteLinkIndex != -1 {
+		link, err := handle.LinkByIndex(defaultRouteLinkIndex)
+		if err != nil {
+			return "", err
+		}
+		addrList, err := handle.AddrList(link, netlink.FAMILY_V6)
+		if err != nil {
+			return "", err
+		}
+		for _, addr := range addrList {
+			if ipHint != "" && ipHint != addr.IP.String() {
+				continue
+			}
+			return addr.IP.String(), nil
+		}
+	}
+
+	// If there is no default route then pick the first ipv6
+	// address that fits.
+	addrList, err := handle.AddrList(nil, netlink.FAMILY_V6)
+	if err != nil {
+		return "", err
+	}
+	for _, addr := range addrList {
+		ip, _, err := tcpnet.ParseCIDR(addr.String())
+		if err != nil {
+			return "", fmt.Errorf("unable to parse CIDR from address %q: %s", addr.String(), err)
+		}
+		if ip.IsLoopback() || ip.IsLinkLocalMulticast() {
+			continue
+		}
+		if ipHint != "" && ipHint != ip.String() {
+			continue
+		}
+		return ip.String(), nil
+	}
+
+	return "", fmt.Errorf("unable to find host IPv6 address")
 }

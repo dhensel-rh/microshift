@@ -21,7 +21,6 @@ import (
 	"crypto/sha256"
 	"encoding/base32"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
@@ -33,19 +32,18 @@ import (
 	"sync/atomic"
 	"time"
 
-	jsonpatch "github.com/evanphx/json-patch"
 	"github.com/google/uuid"
 	"golang.org/x/crypto/cryptobyte"
+	jsonpatch "gopkg.in/evanphx/json-patch.v4"
 
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/version"
 	utilwaitgroup "k8s.io/apimachinery/pkg/util/waitgroup"
-	"k8s.io/apimachinery/pkg/version"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/audit"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
@@ -66,22 +64,26 @@ import (
 	genericfilters "k8s.io/apiserver/pkg/server/filters"
 	"k8s.io/apiserver/pkg/server/healthz"
 	"k8s.io/apiserver/pkg/server/routes"
+	"k8s.io/apiserver/pkg/server/routine"
 	serverstore "k8s.io/apiserver/pkg/server/storage"
 	storagevalue "k8s.io/apiserver/pkg/storage/value"
 	"k8s.io/apiserver/pkg/storageversion"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	utilflowcontrol "k8s.io/apiserver/pkg/util/flowcontrol"
 	flowcontrolrequest "k8s.io/apiserver/pkg/util/flowcontrol/request"
+	utilversion "k8s.io/apiserver/pkg/util/version"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	v1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	restclient "k8s.io/client-go/rest"
+	"k8s.io/component-base/featuregate"
 	"k8s.io/component-base/logs"
 	"k8s.io/component-base/metrics/features"
 	"k8s.io/component-base/metrics/prometheus/slis"
 	"k8s.io/component-base/tracing"
 	"k8s.io/klog/v2"
 	openapicommon "k8s.io/kube-openapi/pkg/common"
+	"k8s.io/kube-openapi/pkg/spec3"
 	"k8s.io/kube-openapi/pkg/validation/spec"
 	"k8s.io/utils/clock"
 	utilsnet "k8s.io/utils/net"
@@ -150,8 +152,11 @@ type Config struct {
 	// done values in this values for this map are ignored.
 	PostStartHooks map[string]PostStartHookConfigEntry
 
-	// Version will enable the /version endpoint if non-nil
-	Version *version.Info
+	// EffectiveVersion determines which apis and features are available
+	// based on when the api/feature lifecyle.
+	EffectiveVersion utilversion.EffectiveVersion
+	// FeatureGate is a way to plumb feature gate through if you have them.
+	FeatureGate featuregate.FeatureGate
 	// AuditBackend is where audit events are sent to.
 	AuditBackend audit.Backend
 	// AuditPolicyRuleEvaluator makes the decision of whether and how to audit log a request.
@@ -198,7 +203,7 @@ type Config struct {
 	// OpenAPIConfig will be used in generating OpenAPI spec. This is nil by default. Use DefaultOpenAPIConfig for "working" defaults.
 	OpenAPIConfig *openapicommon.Config
 	// OpenAPIV3Config will be used in generating OpenAPI V3 spec. This is nil by default. Use DefaultOpenAPIV3Config for "working" defaults.
-	OpenAPIV3Config *openapicommon.Config
+	OpenAPIV3Config *openapicommon.OpenAPIV3Config
 	// SkipOpenAPIInstallation avoids installing the OpenAPI handler if set to true.
 	SkipOpenAPIInstallation bool
 
@@ -213,6 +218,10 @@ type Config struct {
 	// If specified, long running requests such as watch will be allocated a random timeout between this value, and
 	// twice this value.  Note that it is up to the request handlers to ignore or honor this timeout. In seconds.
 	MinRequestTimeout int
+
+	// StorageInitializationTimeout defines the maximum amount of time to wait for storage initialization
+	// before declaring apiserver ready.
+	StorageInitializationTimeout time.Duration
 
 	// This represents the maximum amount of time it should take for apiserver to complete its startup
 	// sequence and become healthy. From apiserver's start time to when this amount of time has
@@ -322,11 +331,6 @@ type Config struct {
 	// NOTE: this option is applicable to Microshift only,
 	//  this should never be enabled for OCP.
 	SendRetryAfterWhileNotReadyOnce bool
-}
-
-// EventSink allows to create events.
-type EventSink interface {
-	Create(event *corev1.Event) (*corev1.Event, error)
 }
 
 type RecommendedConfig struct {
@@ -444,6 +448,7 @@ func NewConfig(codecs serializer.CodecFactory) *Config {
 		MaxMutatingRequestsInFlight:    200,
 		RequestTimeout:                 time.Duration(60) * time.Second,
 		MinRequestTimeout:              1800,
+		StorageInitializationTimeout:   time.Minute,
 		LivezGracePeriod:               time.Duration(0),
 		ShutdownDelayDuration:          time.Duration(0),
 		// 1.5MB is the default client request size in bytes
@@ -506,8 +511,23 @@ func DefaultOpenAPIConfig(getDefinitions openapicommon.GetOpenAPIDefinitions, de
 }
 
 // DefaultOpenAPIV3Config provides the default OpenAPIV3Config used to build the OpenAPI V3 spec
-func DefaultOpenAPIV3Config(getDefinitions openapicommon.GetOpenAPIDefinitions, defNamer *apiopenapi.DefinitionNamer) *openapicommon.Config {
-	defaultConfig := DefaultOpenAPIConfig(getDefinitions, defNamer)
+func DefaultOpenAPIV3Config(getDefinitions openapicommon.GetOpenAPIDefinitions, defNamer *apiopenapi.DefinitionNamer) *openapicommon.OpenAPIV3Config {
+	defaultConfig := &openapicommon.OpenAPIV3Config{
+		IgnorePrefixes: []string{},
+		Info: &spec.Info{
+			InfoProps: spec.InfoProps{
+				Title: "Generic API Server",
+			},
+		},
+		DefaultResponse: &spec3.Response{
+			ResponseProps: spec3.ResponseProps{
+				Description: "Default Response.",
+			},
+		},
+		GetOperationIDAndTags: apiopenapi.GetOperationIDAndTags,
+		GetDefinitionName:     defNamer.GetDefinitionName,
+		GetDefinitions:        getDefinitions,
+	}
 	defaultConfig.Definitions = getDefinitions(func(name string) spec.Ref {
 		defName, _ := defaultConfig.GetDefinitionName(name)
 		return spec.MustCreateRef("#/components/schemas/" + openapicommon.EscapeJsonPointer(defName))
@@ -593,7 +613,7 @@ func (c *Config) AddPostStartHookOrDie(name string, hook PostStartHookFunc) {
 	}
 }
 
-func completeOpenAPI(config *openapicommon.Config, version *version.Info) {
+func completeOpenAPI(config *openapicommon.Config, version *version.Version) {
 	if config == nil {
 		return
 	}
@@ -632,9 +652,53 @@ func completeOpenAPI(config *openapicommon.Config, version *version.Info) {
 	}
 }
 
+func completeOpenAPIV3(config *openapicommon.OpenAPIV3Config, version *version.Version) {
+	if config == nil {
+		return
+	}
+	if config.SecuritySchemes != nil {
+		// Setup OpenAPI security: all APIs will have the same authentication for now.
+		config.DefaultSecurity = []map[string][]string{}
+		keys := []string{}
+		for k := range config.SecuritySchemes {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			config.DefaultSecurity = append(config.DefaultSecurity, map[string][]string{k: {}})
+		}
+		if config.CommonResponses == nil {
+			config.CommonResponses = map[int]*spec3.Response{}
+		}
+		if _, exists := config.CommonResponses[http.StatusUnauthorized]; !exists {
+			config.CommonResponses[http.StatusUnauthorized] = &spec3.Response{
+				ResponseProps: spec3.ResponseProps{
+					Description: "Unauthorized",
+				},
+			}
+		}
+	}
+	// make sure we populate info, and info.version, if not manually set
+	if config.Info == nil {
+		config.Info = &spec.Info{}
+	}
+	if config.Info.Version == "" {
+		if version != nil {
+			config.Info.Version = strings.Split(version.String(), "-")[0]
+		} else {
+			config.Info.Version = "unversioned"
+		}
+	}
+}
+
 // DrainedNotify returns a lifecycle signal of genericapiserver already drained while shutting down.
 func (c *Config) DrainedNotify() <-chan struct{} {
 	return c.lifecycleSignals.InFlightRequestsDrained.Signaled()
+}
+
+// ShutdownInitiated returns a lifecycle signal of apiserver shutdown having been initiated.
+func (c *Config) ShutdownInitiatedNotify() <-chan struct{} {
+	return c.lifecycleSignals.ShutdownInitiated.Signaled()
 }
 
 // HasBeenReadySignal exposes a server's lifecycle signal which is signaled when the readyz endpoint succeeds for the first time.
@@ -645,6 +709,9 @@ func (c *Config) HasBeenReadySignal() <-chan struct{} {
 // Complete fills in any fields not set that are required to have valid data and can be derived
 // from other fields. If you're going to `ApplyOptions`, do that first. It's mutating the receiver.
 func (c *Config) Complete(informers informers.SharedInformerFactory) CompletedConfig {
+	if c.FeatureGate == nil {
+		c.FeatureGate = utilfeature.DefaultFeatureGate
+	}
 	if len(c.ExternalAddress) == 0 && c.PublicAddress != nil {
 		c.ExternalAddress = c.PublicAddress.String()
 	}
@@ -660,9 +727,8 @@ func (c *Config) Complete(informers informers.SharedInformerFactory) CompletedCo
 		}
 		c.ExternalAddress = net.JoinHostPort(c.ExternalAddress, strconv.Itoa(port))
 	}
-
-	completeOpenAPI(c.OpenAPIConfig, c.Version)
-	completeOpenAPI(c.OpenAPIV3Config, c.Version)
+	completeOpenAPI(c.OpenAPIConfig, c.EffectiveVersion.EmulationVersion())
+	completeOpenAPIV3(c.OpenAPIV3Config, c.EffectiveVersion.EmulationVersion())
 
 	if c.DiscoveryAddresses == nil {
 		c.DiscoveryAddresses = discovery.DefaultAddresses{DefaultAddress: c.ExternalAddress}
@@ -684,7 +750,7 @@ func (c *Config) Complete(informers informers.SharedInformerFactory) CompletedCo
 		} else {
 			c.EquivalentResourceRegistry = runtime.NewEquivalentResourceRegistryWithIdentity(func(groupResource schema.GroupResource) string {
 				// use the storage prefix as the key if possible
-				if opts, err := c.RESTOptionsGetter.GetRESTOptions(groupResource); err == nil {
+				if opts, err := c.RESTOptionsGetter.GetRESTOptions(groupResource, nil); err == nil {
 					return opts.ResourcePrefix
 				}
 				// otherwise return "" to use the default key (parent GV name)
@@ -709,8 +775,8 @@ func (c *RecommendedConfig) Complete() CompletedConfig {
 			if len(ns) == 0 {
 				ns = "default"
 			}
-			c.EventSink = &v1.EventSinkImpl{
-				Interface: kubernetes.NewForConfigOrDie(c.ClientConfig).CoreV1().Events(ns),
+			c.EventSink = clientEventSink{
+				&v1.EventSinkImpl{Interface: kubernetes.NewForConfigOrDie(c.ClientConfig).CoreV1().Events(ns)},
 			}
 		}
 	}
@@ -718,37 +784,10 @@ func (c *RecommendedConfig) Complete() CompletedConfig {
 	return c.Config.Complete(c.SharedInformerFactory)
 }
 
-func eventReference() (*corev1.ObjectReference, error) {
-	ns := os.Getenv("POD_NAMESPACE")
-	pod := os.Getenv("POD_NAME")
-	if len(ns) == 0 && len(pod) > 0 {
-		serviceAccountNamespaceFile := "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
-		if _, err := os.Stat(serviceAccountNamespaceFile); err == nil {
-			bs, err := ioutil.ReadFile(serviceAccountNamespaceFile)
-			if err != nil {
-				return nil, err
-			}
-			ns = string(bs)
-		}
-	}
-	if len(ns) == 0 {
-		pod = ""
-		ns = "openshift-kube-apiserver"
-	}
-	if len(pod) == 0 {
-		return &corev1.ObjectReference{
-			Kind:       "Namespace",
-			Name:       ns,
-			APIVersion: "v1",
-		}, nil
-	}
-
-	return &corev1.ObjectReference{
-		Kind:       "Pod",
-		Namespace:  ns,
-		Name:       pod,
-		APIVersion: "v1",
-	}, nil
+var allowedMediaTypes = []string{
+	runtime.ContentTypeJSON,
+	runtime.ContentTypeYAML,
+	runtime.ContentTypeProtobuf,
 }
 
 // New creates a new server which logically combines the handling chain with the passed server.
@@ -757,6 +796,18 @@ func eventReference() (*corev1.ObjectReference, error) {
 func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*GenericAPIServer, error) {
 	if c.Serializer == nil {
 		return nil, fmt.Errorf("Genericapiserver.New() called with config.Serializer == nil")
+	}
+	for _, info := range c.Serializer.SupportedMediaTypes() {
+		var ok bool
+		for _, mt := range allowedMediaTypes {
+			if info.MediaType == mt {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return nil, fmt.Errorf("refusing to create new apiserver %q with support for media type %q (allowed media types are: %s)", name, info.MediaType, strings.Join(allowedMediaTypes, ", "))
+		}
 	}
 	if c.LoopbackClientConfig == nil {
 		return nil, fmt.Errorf("Genericapiserver.New() called with config.LoopbackClientConfig == nil")
@@ -808,37 +859,41 @@ func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*G
 		preShutdownHooks:       map[string]preShutdownHookEntry{},
 		disabledPostStartHooks: c.DisabledPostStartHooks,
 
-		healthzChecks:    c.HealthzChecks,
-		livezChecks:      c.LivezChecks,
-		readyzChecks:     c.ReadyzChecks,
+		healthzRegistry:  healthCheckRegistry{path: "/healthz", checks: c.HealthzChecks},
+		livezRegistry:    healthCheckRegistry{path: "/livez", checks: c.LivezChecks, clock: clock.RealClock{}},
+		readyzRegistry:   healthCheckRegistry{path: "/readyz", checks: c.ReadyzChecks},
 		livezGracePeriod: c.LivezGracePeriod,
 
 		DiscoveryGroupManager: discovery.NewRootAPIsHandler(c.DiscoveryAddresses, c.Serializer),
 
 		maxRequestBodyBytes: c.MaxRequestBodyBytes,
-		livezClock:          clock.RealClock{},
 
 		lifecycleSignals:       c.lifecycleSignals,
 		ShutdownSendRetryAfter: c.ShutdownSendRetryAfter,
 
 		APIServerID:           c.APIServerID,
+		StorageReadinessHook:  NewStorageReadinessHook(c.StorageInitializationTimeout),
 		StorageVersionManager: c.StorageVersionManager,
 
-		Version: c.Version,
+		EffectiveVersion: c.EffectiveVersion,
+		FeatureGate:      c.FeatureGate,
 
 		muxAndDiscoveryCompleteSignals: map[string]<-chan struct{}{},
 
-		eventSink: c.EventSink,
+		OpenShiftGenericAPIServerPatch: OpenShiftGenericAPIServerPatch{
+			eventSink: c.EventSink,
+		},
 	}
 
 	ref, err := eventReference()
 	if err != nil {
 		klog.Warningf("Failed to derive event reference, won't create events: %v", err)
-		c.EventSink = nullEventSink{}
+		s.OpenShiftGenericAPIServerPatch.eventSink = nullEventSink{}
 	}
+	s.RegisterDestroyFunc(c.EventSink.Destroy)
 	s.eventRef = ref
 
-	if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.AggregatedDiscoveryEndpoint) {
+	if c.FeatureGate.Enabled(genericfeatures.AggregatedDiscoveryEndpoint) {
 		manager := c.AggregatedDiscoveryGroupManager
 		if manager == nil {
 			manager = discoveryendpoint.NewResourceManager("apis")
@@ -1006,7 +1061,7 @@ func DefaultBuildHandlerChain(apiHandler http.Handler, c *Config) http.Handler {
 		requestWorkEstimator := flowcontrolrequest.NewWorkEstimator(
 			c.StorageObjectCountTracker.Get, c.FlowControl.GetInterestedWatchCount, workEstimatorCfg, c.FlowControl.GetMaxSeats)
 		handler = filterlatency.TrackCompleted(handler)
-		handler = genericfilters.WithPriorityAndFairness(handler, c.LongRunningFunc, c.FlowControl, requestWorkEstimator)
+		handler = genericfilters.WithPriorityAndFairness(handler, c.LongRunningFunc, c.FlowControl, requestWorkEstimator, c.RequestTimeout/4)
 		handler = filterlatency.TrackStarted(handler, c.TracerProvider, "priorityandfairness")
 	} else {
 		handler = genericfilters.WithMaxInFlightLimit(handler, c.MaxRequestsInFlight, c.MaxMutatingRequestsInFlight, c.LongRunningFunc)
@@ -1036,6 +1091,10 @@ func DefaultBuildHandlerChain(apiHandler http.Handler, c *Config) http.Handler {
 
 	handler = genericfilters.WithCORS(handler, c.CorsAllowedOriginList, nil, nil, nil, "true")
 
+	// WithWarningRecorder must be wrapped by the timeout handler
+	// to make the addition of warning headers threadsafe
+	handler = genericapifilters.WithWarningRecorder(handler)
+
 	// WithTimeoutForNonLongRunningRequests will call the rest of the request handling in a go-routine with the
 	// context with deadline. The go-routine can keep running, while the timeout logic will return a timeout to the client.
 	handler = genericfilters.WithTimeoutForNonLongRunningRequests(handler, c.LongRunningFunc)
@@ -1051,7 +1110,6 @@ func DefaultBuildHandlerChain(apiHandler http.Handler, c *Config) http.Handler {
 	if c.SecureServing != nil && !c.SecureServing.DisableHTTP2 && c.GoawayChance > 0 {
 		handler = genericfilters.WithProbabilisticGoaway(handler, c.GoawayChance)
 	}
-	handler = genericapifilters.WithWarningRecorder(handler)
 	handler = genericapifilters.WithCacheControl(handler)
 	handler = genericfilters.WithHSTS(handler, c.HSTSDirectives)
 	if c.ShutdownSendRetryAfter {
@@ -1060,10 +1118,16 @@ func DefaultBuildHandlerChain(apiHandler http.Handler, c *Config) http.Handler {
 	handler = genericfilters.WithOptInRetryAfter(handler, c.newServerFullyInitializedFunc())
 	handler = genericfilters.WithShutdownResponseHeader(handler, c.lifecycleSignals.ShutdownInitiated, c.ShutdownDelayDuration, c.APIServerID)
 	handler = genericfilters.WithHTTPLogging(handler, c.newIsTerminatingFunc())
-	if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.APIServerTracing) {
+	if c.FeatureGate.Enabled(genericfeatures.APIServerTracing) {
 		handler = genericapifilters.WithTracing(handler, c.TracerProvider)
 	}
 	handler = genericapifilters.WithLatencyTrackers(handler)
+	// WithRoutine will execute future handlers in a separate goroutine and serving
+	// handler in current goroutine to minimize the stack memory usage. It must be
+	// after WithPanicRecover() to be protected from panics.
+	if c.FeatureGate.Enabled(genericfeatures.APIServingWithRoutine) {
+		handler = routine.WithRoutine(handler, c.LongRunningFunc)
+	}
 	handler = genericapifilters.WithRequestInfo(handler, c.RequestInfoResolver)
 	handler = genericapifilters.WithRequestReceivedTimestamp(handler)
 	handler = genericapifilters.WithMuxAndDiscoveryComplete(handler, c.lifecycleSignals.MuxAndDiscoveryComplete.Signaled())
@@ -1095,28 +1159,24 @@ func installAPI(s *GenericAPIServer, c *Config) {
 	if c.EnableMetrics {
 		if c.EnableProfiling {
 			routes.MetricsWithReset{}.Install(s.Handler.NonGoRestfulMux)
-			if utilfeature.DefaultFeatureGate.Enabled(features.ComponentSLIs) {
-				slis.SLIMetricsWithReset{}.Install(s.Handler.NonGoRestfulMux)
-			}
+			slis.SLIMetricsWithReset{}.Install(s.Handler.NonGoRestfulMux)
 		} else {
 			routes.DefaultMetrics{}.Install(s.Handler.NonGoRestfulMux)
-			if utilfeature.DefaultFeatureGate.Enabled(features.ComponentSLIs) {
-				slis.SLIMetrics{}.Install(s.Handler.NonGoRestfulMux)
-			}
+			slis.SLIMetrics{}.Install(s.Handler.NonGoRestfulMux)
 		}
 	}
 
-	routes.Version{Version: c.Version}.Install(s.Handler.GoRestfulContainer)
+	routes.Version{Version: c.EffectiveVersion.BinaryVersion().Info()}.Install(s.Handler.GoRestfulContainer)
 
 	if c.EnableDiscovery {
-		if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.AggregatedDiscoveryEndpoint) {
+		if c.FeatureGate.Enabled(genericfeatures.AggregatedDiscoveryEndpoint) {
 			wrapped := discoveryendpoint.WrapAggregatedDiscoveryToHandler(s.DiscoveryGroupManager, s.AggregatedDiscoveryGroupManager)
 			s.Handler.GoRestfulContainer.Add(wrapped.GenerateWebService("/apis", metav1.APIGroupList{}))
 		} else {
 			s.Handler.GoRestfulContainer.Add(s.DiscoveryGroupManager.WebService())
 		}
 	}
-	if c.FlowControl != nil && utilfeature.DefaultFeatureGate.Enabled(genericfeatures.APIPriorityAndFairness) {
+	if c.FlowControl != nil {
 		c.FlowControl.Install(s.Handler.NonGoRestfulMux)
 	}
 }
@@ -1188,10 +1248,4 @@ func SetHostnameFuncForTests(name string) {
 		err = nil
 		return
 	}
-}
-
-type nullEventSink struct{}
-
-func (nullEventSink) Create(event *corev1.Event) (*corev1.Event, error) {
-	return nil, nil
 }

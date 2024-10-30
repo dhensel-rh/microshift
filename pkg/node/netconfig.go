@@ -18,6 +18,7 @@ package node
 import (
 	"context"
 	"fmt"
+	"net"
 
 	"k8s.io/klog/v2"
 
@@ -35,7 +36,7 @@ const (
 )
 
 type NetworkConfiguration struct {
-	kasAdvertiseAddress        string
+	kasAdvertiseAddresses      []string
 	skipInterfaceConfiguration bool
 }
 
@@ -49,7 +50,7 @@ func (n *NetworkConfiguration) Name() string           { return componentNetwork
 func (n *NetworkConfiguration) Dependencies() []string { return []string{} }
 
 func (n *NetworkConfiguration) configure(cfg *config.Config) {
-	n.kasAdvertiseAddress = cfg.ApiServer.AdvertiseAddress
+	n.kasAdvertiseAddresses = cfg.ApiServer.AdvertiseAddresses
 	n.skipInterfaceConfiguration = cfg.ApiServer.SkipInterface
 }
 
@@ -87,20 +88,31 @@ func (n *NetworkConfiguration) addServiceIPLoopback() error {
 			return err
 		}
 	}
-	address, err := netlink.ParseAddr(fmt.Sprintf("%s/32", n.kasAdvertiseAddress))
-	if err != nil {
-		return err
-	}
-	existing, err := netlink.AddrList(link, netlink.FAMILY_ALL)
-	if err != nil {
-		return err
-	}
-	for _, existingAddress := range existing {
-		if address.Equal(existingAddress) {
-			return nil
+
+	for _, entry := range n.kasAdvertiseAddresses {
+		prefix := 32
+		if net.ParseIP(entry).To4() == nil {
+			prefix = 128
+		}
+		address, err := netlink.ParseAddr(fmt.Sprintf("%s/%d", entry, prefix))
+		if err != nil {
+			return err
+		}
+		existing, err := netlink.AddrList(link, netlink.FAMILY_ALL)
+		if err != nil {
+			return err
+		}
+		for _, existingAddress := range existing {
+			if address.Equal(existingAddress) {
+				return nil
+			}
+		}
+		if err := netlink.AddrAdd(link, address); err != nil {
+			return err
 		}
 	}
-	return netlink.AddrAdd(link, address)
+
+	return nil
 }
 
 func (n *NetworkConfiguration) removeServiceIPLoopback() error {
@@ -114,17 +126,25 @@ func (n *NetworkConfiguration) removeServiceIPLoopback() error {
 			return err
 		}
 	}
-	address, err := netlink.ParseAddr(fmt.Sprintf("%s/32", n.kasAdvertiseAddress))
-	if err != nil {
-		return err
-	}
-	existing, err := netlink.AddrList(link, netlink.FAMILY_ALL)
-	if err != nil {
-		return err
-	}
-	for _, existingAddress := range existing {
-		if address.Equal(existingAddress) {
-			return netlink.AddrDel(link, address)
+	for _, entry := range n.kasAdvertiseAddresses {
+		prefix := 32
+		if net.ParseIP(entry).To4() == nil {
+			prefix = 128
+		}
+		address, err := netlink.ParseAddr(fmt.Sprintf("%s/%d", entry, prefix))
+		if err != nil {
+			return err
+		}
+		existing, err := netlink.AddrList(link, netlink.FAMILY_ALL)
+		if err != nil {
+			return err
+		}
+		for _, existingAddress := range existing {
+			if address.Equal(existingAddress) {
+				if err := netlink.AddrDel(link, address); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	return nil

@@ -86,6 +86,20 @@ func (dm *dataManagement) backup() error {
 	}
 	klog.InfoS("Contents of version file", "contents", versionFile)
 
+	currentBootID, err := getCurrentBootID()
+	if err != nil {
+		return err
+	}
+	if currentBootID == versionFile.BootID {
+		// We don't want to create a backup if versionFile has current boot ID:
+		// backup would be created for current boot - in the middle of it.
+		// Because backups are not updated/overwritten, existence of such backup would prevent
+		// creation of proper backup, i.e. backup for previous boot after reboot.
+		klog.InfoS("Current boot ID and one stored in version file are the same - skipping backup",
+			"current", currentBootID)
+		return nil
+	}
+
 	existingBackups, err := getBackups(dm.dataManager)
 	if err != nil {
 		return err
@@ -97,7 +111,7 @@ func (dm *dataManagement) backup() error {
 		return nil
 	}
 
-	if err := dm.dataManager.Backup(newBackupName); err != nil {
+	if _, err := dm.dataManager.Backup(newBackupName); err != nil {
 		return fmt.Errorf("failed to create backup %q: %w", newBackupName, err)
 	}
 
@@ -126,7 +140,7 @@ func (dm *dataManagement) optionalRestore() error {
 	klog.InfoS("Restore marker file exists - attempting to restore",
 		"path", restoreFilepath)
 
-	currentDeploymentID, err := getCurrentDeploymentID()
+	currentDeploymentID, err := GetCurrentDeploymentID()
 	if err != nil {
 		return err
 	}
@@ -280,7 +294,7 @@ func (dm *dataManagement) backup413() error {
 		}
 	}
 
-	if err := dm.dataManager.Backup(backupName); err != nil {
+	if _, err := dm.dataManager.Backup(backupName); err != nil {
 		return fmt.Errorf("failed to create new 4.13 backup: %w", err)
 	}
 	return nil

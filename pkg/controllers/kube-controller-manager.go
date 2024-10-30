@@ -23,7 +23,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 
+	"github.com/openshift/library-go/pkg/crypto"
 	embedded "github.com/openshift/microshift/assets"
 	"github.com/openshift/microshift/pkg/assets"
 	"github.com/openshift/microshift/pkg/config"
@@ -86,15 +88,17 @@ func configure(ctx context.Context, cfg *config.Config) (args []string, applyFn 
 			"authorization-kubeconfig":         {kubeConfig},
 			"service-account-private-key-file": {kcmServiceAccountPrivateKeyFile()},
 			"allocate-node-cidrs":              {"true"},
-			"cluster-cidr":                     {cfg.Network.ClusterNetwork[0]},
+			"cluster-cidr":                     {strings.Join(cfg.Network.ClusterNetwork, ",")},
+			"service-cluster-ip-range":         {strings.Join(cfg.Network.ServiceNetwork, ",")},
 			"root-ca-file":                     {kcmRootCAFile()},
-			"bind-address":                     {"127.0.0.1"},
 			"secure-port":                      {"10257"},
 			"leader-elect":                     {"false"},
 			"use-service-account-credentials":  {"true"},
 			"cluster-signing-cert-file":        {clusterSigningCert},
 			"cluster-signing-key-file":         {clusterSigningKey},
 			"v":                                {strconv.Itoa(cfg.GetVerbosity())},
+			"tls-cipher-suites":                {strings.Join(crypto.OpenSSLToIANACipherSuites(fixedTLSProfile.Ciphers), ",")},
+			"tls-min-version":                  {string(fixedTLSProfile.MinTLSVersion)},
 		},
 	}
 
@@ -139,7 +143,7 @@ func (s *KubeControllerManager) Run(ctx context.Context, ready chan<- struct{}, 
 	}()
 
 	if err := s.applyFn(); err != nil {
-		klog.Fatalf("failed to apply openshift namespaces %v", err)
+		return fmt.Errorf("failed to apply openshift namespaces: %w", err)
 	}
 	return <-errorChannel
 }

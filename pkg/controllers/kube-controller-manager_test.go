@@ -20,7 +20,10 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/openshift/library-go/pkg/crypto"
 
 	"github.com/google/go-cmp/cmp"
 	embedded "github.com/openshift/microshift/assets"
@@ -46,13 +49,12 @@ func TestConfigure(t *testing.T) {
 		"--allocate-node-cidrs=true",
 		fmt.Sprintf("--authentication-kubeconfig=%s", cfg.KubeConfigPath(config.KubeControllerManager)),
 		fmt.Sprintf("--authorization-kubeconfig=%s", cfg.KubeConfigPath(config.KubeControllerManager)),
-		"--bind-address=127.0.0.1",
 		"--cert-dir=/var/run/kubernetes",
+		"--cloud-provider=external",
 		"--cluster-cidr=10.42.0.0/16",
 		fmt.Sprintf("--cluster-signing-cert-file=%s", clusterSigningCert),
 		"--cluster-signing-duration=720h",
 		fmt.Sprintf("--cluster-signing-key-file=%s", clusterSigningKey),
-		"--configure-cloud-routes=false",
 		"--controllers=*",
 		"--controllers=-bootstrapsigner",
 		"--controllers=-tokencleaner",
@@ -68,6 +70,9 @@ func TestConfigure(t *testing.T) {
 		fmt.Sprintf("--root-ca-file=%s", kcmRootCAFile()),
 		"--secure-port=10257",
 		fmt.Sprintf("--service-account-private-key-file=%s", kcmServiceAccountPrivateKeyFile()),
+		fmt.Sprintf("--service-cluster-ip-range=%s", cfg.Network.ServiceNetwork[0]),
+		fmt.Sprintf("--tls-cipher-suites=%s", strings.Join(crypto.OpenSSLToIANACipherSuites(fixedTLSProfile.Ciphers), ",")),
+		fmt.Sprintf("--tls-min-version=%s", string(fixedTLSProfile.MinTLSVersion)),
 		"--use-service-account-credentials=true",
 		"-v=2",
 	}

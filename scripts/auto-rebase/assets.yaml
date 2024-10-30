@@ -34,6 +34,7 @@ assets:
       - file: namespace.yaml
       - file: service-account.yaml
       - file: service-internal.yaml
+      - file: service-cloud.yaml
       - file: serving-certificate.yaml
         git_restore: True
       - file: cluster-role-aggregate-route.yaml
@@ -91,6 +92,11 @@ assets:
     - file: webhook_config.yaml
     - file: webhook_deployment.yaml
     - file: webhook_service.yaml
+    - file: webhook_serviceaccount.yaml
+    - file: webhook_clusterrole.yaml
+      src: ./rbac/
+    - file: webhook_clusterrolebinding.yaml
+      src: ./rbac/
     - file: volumesnapshotclasses.yaml
     - file: volumesnapshotcontents.yaml
     - file: volumesnapshots.yaml
@@ -183,16 +189,20 @@ assets:
         ignore: "it's a priority class needed for oc debug node command - not available in any repo that rebase is using"
       - file: securityv1-local-apiservice.yaml
         ignore: "it's a local API service for security API group, needed if OpenShift API server is not present"
+      - file: kubelet.yaml
+        src: /machine-config-operator/templates/master/01-master-kubelet/_base/files/kubelet.yaml
 
   - dir: crd/
     src: release-manifests/
     files:
-      - file: 0000_03_security-openshift_01_scc.crd.yaml
-      - file: 0000_03_securityinternal-openshift_02_rangeallocation.crd.yaml
+      - file: 0000_03_config-operator_01_securitycontextconstraints.crd.yaml
+        src: 0000_03_config-operator_01_securitycontextconstraints-Default.crd.yaml
+      - file: 0000_03_config-operator_02_rangeallocations.crd.yaml
       - file: storage_version_migration.crd.yaml
         src:  0000_50_cluster-kube-storage-version-migrator-operator_01_storage_migration_crd.yaml
       - file: route.crd.yaml
-        src:  /kubernetes/vendor/github.com/openshift/api/route/v1/
+        src: /api/route/v1/zz_generated.crd-manifests/routes-Default.crd.yaml
+
 
   - dir: release/
     ignore: "it contains files generated during rebase procedure"
@@ -208,3 +218,85 @@ assets:
 
   - file: embed.go
     ignore: "it's a MicroShift specific Go file that embeds into a binary"
+
+  - dir: optional/operator-lifecycle-manager/
+    src: operator-framework-olm/microshift-manifests/
+    files:
+      - file: 0000_50_olm_00-catalogsources.crd.yaml
+      - file: 0000_50_olm_00-clusterserviceversions.crd.yaml
+      - file: 0000_50_olm_00-installplans.crd.yaml
+      - file: 0000_50_olm_00-namespace.yaml
+      - file: 0000_50_olm_00-olmconfigs.crd.yaml
+      - file: 0000_50_olm_00-operatorconditions.crd.yaml
+      - file: 0000_50_olm_00-operatorgroups.crd.yaml
+      - file: 0000_50_olm_00-operators.crd.yaml
+      - file: 0000_50_olm_00-packageserver.pdb.yaml
+      - file: 0000_50_olm_00-pprof-config.yaml
+      - file: 0000_50_olm_00-pprof-rbac.yaml
+      - file: 0000_50_olm_00-pprof-secret.yaml
+      - file: 0000_50_olm_00-subscriptions.crd.yaml
+      - file: 0000_50_olm_01-olm-operator.serviceaccount.yaml
+      - file: 0000_50_olm_02-olmconfig.yaml
+      - file: 0000_50_olm_02-services.yaml
+      - file: 0000_50_olm_07-olm-operator.deployment.yaml
+      - file: 0000_50_olm_08-catalog-operator.deployment.yaml
+      - file: 0000_50_olm_09-aggregated.clusterrole.yaml
+      - file: 0000_50_olm_13-operatorgroup-default.yaml
+      - file: 0000_50_olm_15-csv-viewer.rbac.yaml
+      - file: image-references
+      - file: kustomization.yaml
+      - file: kustomization.x86_64.yaml
+        ignore: "gets generated during image rebase"
+      - file: kustomization.aarch64.yaml
+        ignore: "gets generated during image rebase"
+      - file: release-olm-aarch64.json
+        ignore: "gets generated during image rebase"
+      - file: release-olm-x86_64.json
+        ignore: "gets generated during image rebase"
+
+  - dir: optional/multus/
+    ignore: "they don't exist in upstream repository - only in microshift"
+    files:
+      - file: kustomization.yaml
+      - file: kustomization.aarch64.yaml
+      - file: kustomization.x86_64.yaml
+      - file: 00-namespace.yaml
+      - file: 01-crd-networkattachmentdefinition.yaml
+      - file: 02-service-account.yaml
+      - file: 03-cluster-role.yaml
+      - file: 04-cluster-role-binding.yaml
+      - file: 05-configmap.yaml
+      - file: 06-daemonset.yaml
+      - file: 07-daemonset-dhcp.yaml
+      - file: release-multus-aarch64.json
+      - file: release-multus-x86_64.json
+
+  - dir: optional/flannel/
+    ignore: "they don't exist in upstream repository - only in microshift"
+    files:
+      - file: kustomization.yaml
+      - file: kustomization.aarch64.yaml
+      - file: kustomization.x86_64.yaml
+      - file: 00-namespace.yaml
+      - file: 01-service-account.yaml
+      - file: 02-cluster-role.yaml
+      - file: 03-cluster-role-binding.yaml
+      - file: 04-configmap.yaml
+      - file: 05-daemonset.yaml
+      - file: release-flannel-aarch64.json
+      - file: release-flannel-x86_64.json
+
+  - dir: optional/kube-proxy/
+    ignore: "they don't exist in upstream repository - only in microshift"
+    files:
+      - file: kustomization.yaml
+      - file: kustomization.aarch64.yaml
+      - file: kustomization.x86_64.yaml
+      - file: 00-namespace.yaml
+      - file: 01-service-account.yaml
+      - file: 02-cluster-role.yaml
+      - file: 03-cluster-role-binding.yaml
+      - file: 04-configmap.yaml
+      - file: 05-daemonset.yaml
+      - file: release-kube-proxy-aarch64.json
+      - file: release-kube-proxy-x86_64.json

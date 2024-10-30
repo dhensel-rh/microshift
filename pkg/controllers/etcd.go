@@ -17,6 +17,7 @@ package controllers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -70,9 +71,14 @@ func (s *EtcdService) Run(ctx context.Context, ready chan<- struct{}, stopped ch
 	// tied to the MicroShift service lifetime.
 	var exe string
 	if runningAsSvc {
+		if err := stopMicroshiftEtcdScopeIfExists(); err != nil {
+			return err
+		}
+
 		args = append(args,
 			"--uid=root",
 			"--scope",
+			"--collect",
 			"--unit", "microshift-etcd",
 			"--property", "Before=microshift.service",
 			"--property", "BindsTo=microshift.service",
@@ -111,17 +117,22 @@ func (s *EtcdService) Run(ctx context.Context, ready chan<- struct{}, stopped ch
 		}
 		klog.Infof("%v process quit: %v", s.Name(), cmd.ProcessState.String())
 
-		// Exit microshift to trigger microshift-etcd restart
-		klog.Warning("microshift-etcd process terminated prematurely, restarting MicroShift")
-		os.Exit(0)
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			// Exit microshift to trigger microshift-etcd restart
+			klog.Warning("microshift-etcd process terminated prematurely, restarting MicroShift")
+			os.Exit(0)
+		} else {
+			klog.Info("MicroShift is mid shutdown - ignoring etcd termination")
+		}
 	}()
 
 	// Ensures microshift-etcd unit stopped after microshift
 	defer func() {
+		klog.Info("stopping microshift-etcd")
 		cmd := exec.Command("systemctl", "stop", "microshift-etcd.scope", "--no-block")
 
-		if err = cmd.Run(); err != nil {
-			klog.Warningf("failed to stop microshift-etcd: %v", err)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			klog.ErrorS(err, "failed to stop microshift-etcd", "output", string(out))
 			return
 		}
 	}()
@@ -137,6 +148,26 @@ func (s *EtcdService) Run(ctx context.Context, ready chan<- struct{}, stopped ch
 	return ctx.Err()
 }
 
+func stopMicroshiftEtcdScopeIfExists() error {
+	// There are several codes that systemctl can return like
+	// 0 - unit is active, 3 - unit is not active, 4 - no such unit.
+	// Because microshift-etcd.scope is transient unit it's either active or doesn't exist,
+	// just check for active (existing) to simplify procedure.
+	statusCmd := exec.Command("systemctl", "status", "microshift-etcd.scope")
+	if err := statusCmd.Run(); err != nil {
+		// nolint:nilerr
+		return nil
+	}
+
+	klog.InfoS("microshift-etcd.scope is already active - stopping")
+	stopCmd := exec.Command("systemctl", "stop", "microshift-etcd.scope")
+	if out, err := stopCmd.CombinedOutput(); err != nil {
+		klog.ErrorS(err, "failed to stop microshift-etcd", "output", string(out))
+		return err
+	}
+	return nil
+}
+
 func checkIfEtcdIsReady(ctx context.Context) error {
 	client, err := getEtcdClient(ctx)
 	if err != nil {
@@ -150,6 +181,9 @@ func checkIfEtcdIsReady(ctx context.Context) error {
 			return nil
 		} else {
 			klog.Infof("etcd not ready yet: %v", err)
+			if err == context.Canceled {
+				return err
+			}
 		}
 	}
 	return fmt.Errorf("etcd still not healthy after checking %d times", HealthCheckRetries)

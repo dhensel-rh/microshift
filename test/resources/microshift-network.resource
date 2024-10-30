@@ -3,6 +3,7 @@ Documentation       Keywords for testing the MicroShift network
 
 Library             Process
 Library             SSHLibrary
+Library             libipv6.py
 Resource            oc.resource
 Resource            common.resource
 
@@ -12,17 +13,20 @@ ${HELLO_USHIFT}     ./assets/hello-microshift.yaml
 ${LB_PORT}          5678
 ${NP_PORT}          32222
 ${HTTP_PORT}        80
+${HTTPS_PORT}       443
 
 
 *** Keywords ***
 Create Hello MicroShift Pod
     [Documentation]    Create a pod running the "hello microshift" application
-    Oc Create    -f ${HELLO_USHIFT} -n ${NAMESPACE}
-    Labeled Pod Should Be Ready    app\=hello-microshift    timeout=120s
+    [Arguments]    ${ns}=${NAMESPACE}
+    Oc Create    -f ${HELLO_USHIFT} -n ${ns}
+    Labeled Pod Should Be Ready    app\=hello-microshift    timeout=120s    ns=${ns}
 
 Expose Hello MicroShift
     [Documentation]    Expose the "hello microshift" application via cluster ip service
-    Run With Kubeconfig    oc expose pod hello-microshift -n ${NAMESPACE}
+    [Arguments]    ${ns}=${NAMESPACE}
+    Run With Kubeconfig    oc expose pod hello-microshift -n ${ns}
 
 Expose Hello MicroShift Pod Via LB
     [Documentation]    Expose the "hello microshift" application through the load balancer
@@ -34,20 +38,64 @@ Expose Hello MicroShift Pod Via NodePort
     ...    oc create service nodeport hello-microshift --node-port=${NP_PORT} --tcp=8080 -n ${NAMESPACE}
 
 Access Hello Microshift
-    [Documentation]    Try to retrieve data from the "hello microshift" service end point
-    [Arguments]    ${ushift_port}    ${ushift_ip}=${USHIFT_HOST}    ${path}=${EMPTY}
+    [Documentation]    Use curl to make a GET request to the specified scheme, host, port and path.
+    ...    Use hello-microshift as authority and swap it with --connect-to option.
+    ...    Returns all output and return code.
+    ...    Times out after 15s.
+    [Arguments]
+    ...    ${ushift_port}
+    ...    ${ushift_ip}=${USHIFT_HOST}
+    ...    ${path}=${EMPTY}
+    ...    ${scheme}=http
+    ...    ${hostname}=hello-microshift.cluster.local
 
-    ${connect_to}=    Set Variable    "hello-microshift.cluster.local:${HTTP_PORT}:${ushift_ip}:${ushift_port}"
-    ${url_path}=    Set Variable    "http://hello-microshift.cluster.local${path}"
+    ${ip}=    Add Brackets If Ipv6    ${ushift_ip}
+
+    ${connect_to}=    Set Variable    "${hostname}::${ip}:"
+    ${url_path}=    Set Variable    "${scheme}://${hostname}:${ushift_port}${path}"
 
     ${result}=    Run Process
-    ...    curl -i ${url_path} --connect-to ${connect_to}
+    ...    curl -k -i ${url_path} --connect-to ${connect_to}
     ...    shell=True
     ...    timeout=15s
-    Log Many    ${result.rc}    ${result.stdout}    ${result.stderr}
-    Should Be Equal As Integers    ${result.rc}    0
-    Should Match Regexp    ${result.stdout}    HTTP.*200
-    Should Match    ${result.stdout}    *Hello MicroShift*
+    RETURN    ${result.rc}    ${result.stdout}    ${result.stderr}
+
+Access Hello MicroShift Success
+    [Documentation]    Expect 200 OK when accessing "hello microshift" through the router.
+    [Arguments]
+    ...    ${ushift_port}
+    ...    ${ushift_ip}=${USHIFT_HOST}
+    ...    ${path}=${EMPTY}
+    ...    ${scheme}=http
+    ...    ${hostname}=hello-microshift.cluster.local
+
+    ${rc}    ${stdout}    ${stderr}=    Access Hello MicroShift
+    ...    ushift_port=${ushift_port}
+    ...    ushift_ip=${ushift_ip}
+    ...    path=${path}
+    ...    scheme=${scheme}
+    ...    hostname=${hostname}
+    Should Be Equal As Integers    ${rc}    0
+    Should Match Regexp    ${stdout}    HTTP.*200
+    Should Match    ${stdout}    *Hello MicroShift*
+
+Access Hello MicroShift No Route
+    [Documentation]    Expect 503 Service Unavailable when accessing "hello microshift" through the router.
+    [Arguments]
+    ...    ${ushift_port}
+    ...    ${ushift_ip}=${USHIFT_HOST}
+    ...    ${path}=${EMPTY}
+    ...    ${scheme}=http
+    ...    ${hostname}=hello-microshift.cluster.local
+
+    ${rc}    ${stdout}    ${stderr}=    Access Hello MicroShift
+    ...    ushift_port=${ushift_port}
+    ...    ushift_ip=${ushift_ip}
+    ...    path=${path}
+    ...    scheme=${scheme}
+    ...    hostname=${hostname}
+    Should Be Equal As Integers    ${rc}    0
+    Should Match Regexp    ${stdout}    HTTP.*503
 
 Verify Hello MicroShift LB
     [Documentation]    Run Hello MicroShift Load Balancer verification
@@ -61,5 +109,6 @@ Verify Hello MicroShift LB
 
 Delete Hello MicroShift Pod And Service
     [Documentation]    Delete service and pod for cleanup.
-    Oc Delete    service/hello-microshift -n ${NAMESPACE}
-    Oc Delete    -f ${HELLO_USHIFT} -n ${NAMESPACE}
+    [Arguments]    ${ns}=${NAMESPACE}
+    Oc Delete    service/hello-microshift -n ${ns}
+    Oc Delete    -f ${HELLO_USHIFT} -n ${ns}

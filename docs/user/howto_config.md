@@ -9,6 +9,16 @@ The format of the `config.yaml` configuration file is as follows.
 ```yaml
 apiServer:
     advertiseAddress: ""
+    auditLog:
+        maxFileAge: 0
+        maxFileSize: 0
+        maxFiles: 0
+        profile: ""
+    namedCertificates:
+        - certPath: ""
+          keyPath: ""
+          names:
+            - ""
     subjectAltNames:
         - ""
 debugging:
@@ -17,18 +27,34 @@ dns:
     baseDomain: ""
 etcd:
     memoryLimitMB: 0
+ingress:
+    listenAddress:
+        - ""
+    ports:
+        http: 0
+        https: 0
+    routeAdmissionPolicy:
+        namespaceOwnership: ""
+    status: ""
+kubelet:
 manifests:
     kustomizePaths:
         - ""
 network:
     clusterNetwork:
         - ""
+    cniPlugin: ""
     serviceNetwork:
         - ""
     serviceNodePortRange: ""
 node:
     hostnameOverride: ""
     nodeIP: ""
+    nodeIPv6: ""
+storage:
+    driver: ""
+    optionalCsiComponents:
+        - ""
 
 ```
 <!---
@@ -45,6 +71,16 @@ In case `config.yaml` is not provided, the following default settings will be us
 ```yaml
 apiServer:
     advertiseAddress: ""
+    auditLog:
+        maxFileAge: 0
+        maxFileSize: 200
+        maxFiles: 10
+        profile: Default
+    namedCertificates:
+        - certPath: ""
+          keyPath: ""
+          names:
+            - ""
     subjectAltNames:
         - ""
 debugging:
@@ -53,6 +89,16 @@ dns:
     baseDomain: example.com
 etcd:
     memoryLimitMB: 0
+ingress:
+    listenAddress:
+        - ""
+    ports:
+        http: 80
+        https: 443
+    routeAdmissionPolicy:
+        namespaceOwnership: InterNamespaceAllowed
+    status: Managed
+kubelet:
 manifests:
     kustomizePaths:
         - /usr/lib/microshift/manifests
@@ -62,12 +108,18 @@ manifests:
 network:
     clusterNetwork:
         - 10.42.0.0/16
+    cniPlugin: ""
     serviceNetwork:
         - 10.43.0.0/16
     serviceNodePortRange: 30000-32767
 node:
     hostnameOverride: ""
     nodeIP: ""
+    nodeIPv6: ""
+storage:
+    driver: ""
+    optionalCsiComponents:
+        - ""
 
 ```
 <!---
@@ -116,7 +168,7 @@ Setting the `memoryLimitMB` to a value greater than 0 will result in a soft memo
 
 Please note that values close to the floor may be more likely to impact etcd performance - the memory limit is a trade-off of memory footprint and etcd performance. The lower the limit, the more time etcd will spend on paging memory to disk and will take longer to respond to queries or even timing requests out if the limit is low and the etcd usage is high.
 
-# Auto-applying Manifests
+## Auto-applying Manifests
 
 MicroShift leverages `kustomize` for Kubernetes-native templating and declarative management of resource objects. Upon start-up, it searches `/etc/microshift/manifests`, `/etc/microshift/manifests.d/*`, `/usr/lib/microshift/manifests`, and `/usr/lib/microshift/manifests.d/*` directories for a `kustomization.yaml`, `kustomization.yml`, or `Kustomization` file. If it finds one, it automatically runs `kubectl apply -k` command to apply that manifest.
 
@@ -154,7 +206,7 @@ manifests:
 ```
 
 
-## Manifest Example
+### Manifest Example
 
 The example demonstrates automatic deployment of a `busybox` container using `kustomize` manifests in the `/etc/microshift/manifests` directory.
 
@@ -212,6 +264,131 @@ sudo systemctl restart microshift
 oc get pods -n busybox
 ```
 
+### Deleting Manifests
+
+MicroShift supports resource manifest deletion for data removal or upgrade scenarios.
+Upgrade scenarios include situations where some objects should be removed, but not all of them to keep the data.
+
+MicroShift scans `delete` subdirectories of configured manifests directory.
+Given the default configuration, MicroShift will run `kubectl delete -k --ignore-not-found=true .` for any kustomization file found in following paths:
+- `/etc/microshift/manifests/delete`
+- `/etc/microshift/manifests.d/delete/*`
+- `/usr/lib/microshift/manifests/delete`
+- `/usr/lib/microshift/manifests.d/delete/*`
+
+For delete scenarios, just move the existing manifest to one of the `delete` directories.
+
+For resource removal in upgrade scenarios, is not necessary to include `spec`. Specify `group/version`, `kind`, `name`, and `namespace` of an object.
+```yaml
+# kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - all_resources.yaml
+
+# all_resources.yaml
+kind: DaemonSet
+apiVersion: apps/v1
+metadata:
+  name: multus
+  namespace: openshift-multus
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dhcp-daemon
+  namespace: openshift-multus
+```
+
 ## Storage Configuration
 
-MicroShift's included CSI plugin manages LVM LogicialVolumes to provide persistent workload storage. For specific storage configuration, refer to the dedicated [documentation](../contributor/storage/configuration.md).
+MicroShift's included CSI plugin manages LVM LogicalVolumes to provide persistent workload storage. For LVMS
+configuration, refer to the dedicated [documentation](../contributor/storage/configuration.md).
+
+### Opt-Out of LVMS / Snapshotting Components
+
+Users may prevent either the LVMS CSI driver or the CSI Snapshotter, or both, from being deployed. This is done by
+specifying supported values under `.storage` node of the MicroShift config in the following ways:
+
+```yaml
+  storage
+    driver: **ENUM**
+  ```
+  - Accepted values: `"none"`, `"lvms"`
+  - Empty value or null field defaults to deploying LVMS.
+
+```yaml
+storage
+  optionalCsiComponents: **ARRAY**.
+```
+  - Expected values are: `['csi-snapshot-controller', 'csi-snapshot-webhook', 'none']`. `'none'` is mutually exclusive
+  with all other values.
+  - Empty array defaults to deploying `snapshot-controller` and `snapshot-webhook`.
+
+### Automated Uninstallation is Not Supported
+
+Automated uninstallation is not supported because it poses a risk of orphaning provisioned volumes. Without the LVMS CSI
+driver, the cluster has no knowledge of the underlying storage interface and thus cannot perform
+provisioning/deprovisioning or mount/unmount operations. Workloads with attached volumes must be manually stopped, and
+those volumes must then be manually deleted by the user. Once the MicroShift config `storage` section is specified with
+supported values, the user may restart MicroShift. They should see that MicroShift does not redeploy the disabled
+components after restart.
+
+## Drop-in configuration directory
+
+In addition to the existing `/etc/microshift/config.yaml` configuration file there is a `/etc/microshift/config.d` configuration directory where you can place fragments of configuration.
+
+At runtime, `/etc/microshift/config.yaml` and `.yaml` files inside `/etc/microshift/config.d` are merged together to create one configuration file which overrides the defaults.
+
+Files in `/etc/microshift/config.d` are sorted lexicographilly. It is recommended to use numerical prefix for easy reasoning about the priority of the fragments.
+
+For example, given following files:
+- `/etc/microshift/config.yaml`
+- `/etc/microshift/config.d/10-subjectAltNames.yaml`
+- `/etc/microshift/config.d/20-kubelet.yaml`
+
+The final user config will be created by using `config.yaml` as a base, and then overwriting it with `10-subjectAltNames.yaml`, and then overwriting it with `20-kubelet.yaml`:
+```
+20-kubelet.yaml
+     ||
+     \/
+10-subjectAltNames.yaml
+     ||
+     \/
+config.yaml
+```
+
+Some additional rules:
+- Lists are not merged together, they are overwritten. For example:
+  ```yaml
+  # 10-san.yaml
+  apiServer:
+    subjectAltNames:
+      - host1
+      - host2
+
+  # 20-san.yaml
+  apiServer:
+    subjectAltNames:
+      - hostZ
+
+  # end result
+  apiServer:
+    subjectAltNames:
+      - hostZ
+  ```
+- Contents of `kubelet:` configuration are merged together (unless specific field is a list). For example:
+  ```yaml
+  # 10-kubelet.yaml
+  kubelet:
+    some_setting: True
+
+  # 20-kubelet.yaml
+  kubelet:
+    another_setting: True
+
+  # end result
+  kubelet:
+    some_setting: True
+    another_setting: True
+  ```

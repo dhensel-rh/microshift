@@ -42,7 +42,7 @@ spec:
             - name: ROUTER_DISABLE_HTTP2
               value: "true"
             - name: ROUTER_DISABLE_NAMESPACE_OWNERSHIP_CHECK
-              value: "false"
+              value: '{{.RouterNamespaceOwnership}}'
             - name: ROUTER_LOAD_BALANCE_ALGORITHM
               value: random
             - name: ROUTER_METRICS_TYPE
@@ -63,21 +63,36 @@ spec:
               value: 1s
             - name: ROUTER_DOMAIN
               value: apps.{{ .BaseDomain }}
+            - name: ROUTER_IP_V4_V6_MODE
+              value: '{{ .RouterMode }}'
           livenessProbe:
+            failureThreshold: 3
             httpGet:
               path: /healthz
               port: 1936
+              scheme: HTTP
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 1
             terminationGracePeriodSeconds: 10
           readinessProbe:
+            failureThreshold: 3
             httpGet:
               path: /healthz/ready
               port: 1936
+              scheme: HTTP
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 1
           startupProbe:
             failureThreshold: 120
             httpGet:
               path: /healthz/ready
               port: 1936
+              scheme: HTTP
             periodSeconds: 1
+            successThreshold: 1
+            timeoutSeconds: 1
           resources:
             requests:
               cpu: 100m
@@ -94,14 +109,22 @@ spec:
             - name: http
               containerPort: 80
               protocol: TCP
-              hostPort: 80
             - name: https
               containerPort: 443
               protocol: TCP
-              hostPort: 443
             - name: metrics
               containerPort: 1936
               protocol: TCP
+          args:
+            - -v=4
+      tolerations:
+        # Ensure the pod isn't deleted during serial NoExecuteTaintManager tests.
+        # Remember that NoExecute uses Delete, not Evict, because removing the pod
+        # is non-optional.  This means that PDBs are not honored.
+        - key: "kubernetes.io/e2e-evict-taint-key"
+          operator: "Equal"
+          value: "evictTaintVal"
+          effect: "NoExecute"
       volumes:
         - name: default-certificate
           secret:
@@ -109,14 +132,13 @@ spec:
             secretName: router-certs-default
         - name: service-ca-bundle
           configMap:
+            defaultMode: 420
             items:
               - key: service-ca.crt
                 path: service-ca.crt
             name: service-ca-bundle
             optional: false
-          defaultMode: 420
       restartPolicy: Always
-      terminationGracePeriodSeconds: 3600
       dnsPolicy: ClusterFirst
       nodeSelector:
         kubernetes.io/os: linux

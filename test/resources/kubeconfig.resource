@@ -4,7 +4,9 @@ Documentation       Keywords for accessing a kubeconfig file for the MicroShift 
 Library             OperatingSystem
 Library             String
 Library             DataFormats.py
+Library             libipv6.py
 Resource            ../resources/microshift-host.resource
+Resource            ../resources/common.resource
 
 
 *** Variables ***
@@ -30,13 +32,20 @@ Setup Kubeconfig
     # If we have been given an explicit API port to use, make sure that
     # port appears in the kubeconfig file.
     IF    "${API_PORT}"!="${EMPTY}"
+        ${ip}=    Add Brackets If Ipv6    ${USHIFT_HOST}
         ${kubeconfig}=    Update Kubeconfig Server Url
         ...    ${kubeconfig}
-        ...    https://${USHIFT_HOST}:${API_PORT}
+        ...    https://${ip}:${API_PORT}
     END
-    ${rand}=    Generate Random String
-    ${path}=    Join Path    /tmp    ${rand}
-    Create File    ${path}    ${kubeconfig}
+    ${path}=    Create Random Temp File    ${kubeconfig}
+    Set Suite Variable    \${KUBECONFIG}    ${path}
+
+Setup Custom Kubeconfig
+    [Documentation]    Get the kubeconfig file from the path,
+    ...    and export it as $KUBECONFIG variable.
+    [Arguments]    ${custom_path}
+    ${kubeconfig}=    Get Kubeconfig    ${custom_path}
+    ${path}=    Create Random Temp File    ${kubeconfig}
     Set Suite Variable    \${KUBECONFIG}    ${path}
 
 Remove Kubeconfig
@@ -46,13 +55,19 @@ Remove Kubeconfig
 Run With Kubeconfig
     [Documentation]    Run a command using KUBECONFIG from the test suite.
     [Arguments]    ${cmd}    ${allow_fail}=False
-    ${result}=    Run Process    ${cmd}    env:KUBECONFIG=${KUBECONFIG}    stderr=STDOUT    shell=True
+    ${stdout_file}=    Create Random Temp File
+    ${result}=    Run Process    ${cmd}    env:KUBECONFIG=${KUBECONFIG}
+    ...    stderr=STDOUT    shell=True
+    ...    stdout=${stdout_file}
+
     Log    ${result.stdout}
     Log    ${result.stderr}
     IF    ${allow_fail} == False
         Should Be Equal As Integers    ${result.rc}    0
     END
-    RETURN    ${result.stdout}
+    ${stdout}=    OperatingSystem.Get File    ${stdout_file}
+    ${stdout}=    Strip String    ${stdout}    # strip \n character at the end
+    RETURN    ${stdout}
 
 Create Namespace
     [Documentation]    Creates a namespace with the given name.

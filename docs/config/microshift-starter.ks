@@ -7,14 +7,14 @@ reboot
 # Configure network to use DHCP and activate on boot
 network --bootproto=dhcp --device=link --activate --onboot=on
 
-# Partition disk with a 1MB BIOS boot, 200M EFI, 800M boot XFS partition and
-# an LVM volume containing a 10GB+ system root. The remainder of the volume
-# will be used by the CSI driver for storing data
+# Partition the disk with hardware-specific boot and swap partitions, adding an
+# LVM volume that contains a 10GB+ system root. The remainder of the volume will
+# be used by the CSI driver for storing data.
 zerombr
-clearpart --all --disklabel gpt
-part biosboot --fstype=biosboot --size=1
-part /boot/efi --fstype=efi --size=200
-part /boot --fstype=xfs --asprimary --size=800
+clearpart --all --initlabel
+# Create boot and swap partitions as required by the current hardware platform
+reqpart --add-boot
+# Add an LVM volume group and allocate a system root logical volume
 part pv.01 --grow
 volgroup rhel pv.01
 logvol / --vgname=rhel --fstype=xfs --size=10240 --name=root
@@ -53,10 +53,11 @@ RuntimeMaxUse=1G
 EOF
 
 # Make sure all the Ethernet network interfaces are connected automatically
-for uuid in $(nmcli -f uuid,type,autoconnect connection | awk '$2 == "ethernet" && $3 == "no" {print $1}') ; do
-    # Remove autoconnect option from the configuration file to keep it enabled after reboot
-    file=$(nmcli -f uuid,filename connection | awk -v uuid=${uuid} '$1 == uuid' | sed "s/${uuid}//g" | xargs)
-    sed -i '/autoconnect=.*/d' "${file}"
+# by removing autoconnect option from the configuration files
+find /etc/NetworkManager -name '*.nmconnection' -print0 | while IFS= read -r -d $'\0' file ; do
+    if grep -qE '^type=ethernet' "${file}" ; then
+        sed -i '/autoconnect=.*/d' "${file}"
+    fi
 done
 
 %end

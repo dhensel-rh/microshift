@@ -3,18 +3,18 @@ This document describes how to setup the MicroShift development environment runn
 in a virtual machine.
 
 ## Create Development Virtual Machine
-Start by downloading one of the boot DVD images for the `x86_64` or `aarch64` architecture:
-* RHEL 9.2 from https://developers.redhat.com/products/rhel/download
+Start by downloading one of the DVD ISO images for the `x86_64` or `aarch64` architecture:
+* RHEL 9.4 from https://developers.redhat.com/products/rhel/download
 * CentOS 9 Stream from https://www.centos.org/download
 
 ### Creating VM
 Log into the hypervisor host and run the following commands to create a RHEL virtual
-machine with 4 cores, 8GB of RAM and 70GB of storage.
+machine with 4 cores, 8GB of RAM and 100GB of storage.
 
 > See [Increase Virtual Machine Disk Size](#increase-virtual-machine-disk-size) section
 > for increasing the storage size if necessary.
 
-Move the boot DVD image to `/var/lib/libvirt/images` directory and run the following
+Move the DVD ISO image to `/var/lib/libvirt/images` directory and run the following
 commands to install the `libvirt` packages and create a virtual machine.
 ```
 VMNAME="microshift-dev"
@@ -306,4 +306,123 @@ sudo lvextend -l +95%FREE /dev/mapper/rhel-root
 
 # Resize the file system
 sudo xfs_growfs /dev/mapper/rhel-root
+```
+
+### Sharing Directory with Development Virtual Machine
+
+When the MicroShift development environment is running inside a virtual machine,
+it is sometimes convenient to share the MicroShift repository directory between
+the host and the virtual machine (e.g. to build artifacts on the development
+machine and run on the host, etc.).
+
+One way of sharing the directory is to use NFS mounts. Follow the instructions
+in the remainder of this section to implement the directory mount.
+
+#### Host Configuration
+
+Run the following commands to create and export the directory over an NFS mount.
+
+```
+EXPORT_DIR=/home/microshift-shared
+
+sudo dnf install -y nfs-utils
+
+sudo mkdir -p "${EXPORT_DIR}"
+sudo chown nobody:nobody "${EXPORT_DIR}"
+sudo chmod 755 "${EXPORT_DIR}"
+
+echo "${EXPORT_DIR} *(rw,async,no_root_squash,no_subtree_check)" | sudo tee -a /etc/exports
+sudo exportfs -arv
+```
+
+Run the following commands to configure the NFS service and firewall rules.
+
+```
+sudo systemctl restart nfs-server
+sudo systemctl enable nfs-server
+
+sudo firewall-cmd --permanent --zone=libvirt --add-service=nfs
+sudo firewall-cmd --permanent --zone=libvirt --add-service=mountd
+sudo firewall-cmd --permanent --zone=libvirt --add-service=rpc-bind
+sudo firewall-cmd --reload
+```
+
+Run the following commands to note down the IP address to be used when mounting
+the directory from the virtual machine.
+
+```
+BRIDGE_DEV=$(sudo virsh net-info default | grep '^Bridge:' | awk '{print $2}')
+BRIDGE_IP=$(ip -f inet addr show "${BRIDGE_DEV}" | grep inet)
+
+echo "${BRIDGE_IP}" | awk '{print $2}' | cut -d/ -f1
+```
+
+#### Virtual Machine Configuration
+
+```
+MOUNT_DIR=/home/microshift-shared
+BRIDGE_IP=192.168.100.1
+
+sudo dnf install -y nfs-utils
+
+sudo mkdir -p "${MOUNT_DIR}"
+sudo mount -t nfs4 -o context="system_u:object_r:container_file_t:s0" "${BRIDGE_IP}:${MOUNT_DIR}" "${MOUNT_DIR}"
+```
+
+If the mount works properly, make it permanent by running the following command.
+
+```
+echo "${BRIDGE_IP}:${MOUNT_DIR} ${MOUNT_DIR} nfs4 rw,hard,intr,noatime,context=\"system_u:object_r:container_file_t:s0\" 0 0" | sudo tee -a /etc/fstab
+```
+
+#### Synchronize User and Group Identifiers
+
+For read-write to work properly both on the hypervisor host and on the virtual
+machine, it is recommended to edit the `microshift` user and group
+identifiers on the virtual machine to have the value as on the hypervisor.
+
+Edit the `/etc/passwd` and `/etc/group` files on the virtual machine to replace
+the `microshift` user and group identifiers. The goal is for the `id -u; id -g`
+command to return the same identifiers when run on the host and on the virtual
+machine.
+
+Here is an example of setting the user and group identifiers to `12345` value on
+the virtual machine.
+
+```
+$ grep ^microshift /etc/passwd
+microshift:x:12345:12345::/home/microshift:/bin/bash
+
+$ grep ^microshift /etc/group
+microshift:x:12345:
+```
+
+Run the following commands to fix the ownership of the user home directory and
+the shared directory.
+
+```
+MOUNT_DIR=/home/microshift-shared
+
+sudo chown -R $(whoami). ~
+sudo chown -R $(whoami). "${MOUNT_DIR}"
+
+# Delete user-specific container cache
+sudo rm -rf ~/.local/share/containers/
+```
+
+Reboot the development virtual machine to finalize the configuration.
+
+#### Using Shared Directory
+
+Run the following commands to move the original source tree to a shared location
+and link it from the `microshift` user home directory. Note that this allows to
+keep all the user configuration files locally while sharing the source tree.
+
+```
+MOUNT_DIR=/home/microshift-shared
+
+sudo mv ~/microshift "${MOUNT_DIR}/"
+
+# Do not attempt to create the link if the target already exists
+[ ! -e ~/microshift ] && ln -s "${MOUNT_DIR}/microshift" ~/microshift
 ```

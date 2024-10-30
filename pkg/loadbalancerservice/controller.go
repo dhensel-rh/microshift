@@ -3,9 +3,12 @@ package loadbalancerservice
 import (
 	"context"
 	"fmt"
+	"net"
+	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -20,23 +23,42 @@ import (
 	"github.com/openshift/microshift/pkg/servicemanager"
 )
 
-const defaultInformerResyncPeriod = 10 * time.Minute
+const (
+	defaultInformerResyncPeriod = 10 * time.Minute
+)
 
 type LoadbalancerServiceController struct {
-	NodeIP     string
-	KubeConfig string
-	client     *kubernetes.Clientset
-	indexer    cache.Indexer
-	queue      workqueue.RateLimitingInterface
-	informer   cache.SharedIndexInformer
+	IPAddresses []string
+	NICNames    []string
+	NodeIP      string
+	KubeConfig  string
+	Ipv4        bool
+	Ipv6        bool
+	client      *kubernetes.Clientset
+	indexer     cache.Indexer
+	queue       workqueue.TypedRateLimitingInterface[string]
+	informer    cache.SharedIndexInformer
 }
 
 var _ servicemanager.Service = &LoadbalancerServiceController{}
 
 func NewLoadbalancerServiceController(cfg *config.Config) *LoadbalancerServiceController {
+	ipAddresses := make([]string, 0, len(cfg.Ingress.ListenAddress))
+	nicNames := make([]string, 0, len(cfg.Ingress.ListenAddress))
+	for _, entry := range cfg.Ingress.ListenAddress {
+		if net.ParseIP(entry) != nil {
+			ipAddresses = append(ipAddresses, entry)
+		} else {
+			nicNames = append(nicNames, entry)
+		}
+	}
 	return &LoadbalancerServiceController{
-		NodeIP:     cfg.Node.NodeIP,
-		KubeConfig: cfg.KubeConfigPath(config.KubeAdmin),
+		IPAddresses: ipAddresses,
+		NICNames:    nicNames,
+		NodeIP:      cfg.Node.NodeIP,
+		KubeConfig:  cfg.KubeConfigPath(config.KubeAdmin),
+		Ipv4:        cfg.IsIPv4(),
+		Ipv6:        cfg.IsIPv6(),
 	}
 }
 
@@ -71,7 +93,7 @@ func (c *LoadbalancerServiceController) Run(ctx context.Context, ready chan<- st
 	factory := informers.NewSharedInformerFactory(c.client, defaultInformerResyncPeriod)
 	serviceInformer := factory.Core().V1().Services()
 	c.informer = serviceInformer.Informer()
-	c.queue = workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
+	c.queue = workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
 	c.indexer = c.informer.GetIndexer()
 	_, err = c.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
@@ -105,6 +127,8 @@ func (c *LoadbalancerServiceController) Run(ctx context.Context, ready chan<- st
 
 	go wait.Until(c.runWorker, time.Second, stopCh)
 
+	go defaultRouterWatch(c.IPAddresses, c.NICNames, c.Ipv4, c.Ipv6, c.updateDefaultRouterServiceStatus, stopCh)
+
 	close(ready)
 
 	<-ctx.Done()
@@ -124,13 +148,13 @@ func (c *LoadbalancerServiceController) processNextItem() bool {
 	}
 	defer c.queue.Done(key)
 
-	err := c.updateServiceStatus(key.(string))
+	err := c.updateServiceStatus(key)
 	c.handleErr(err, key)
 	return true
 }
 
 // handleErr checks if an error happened and makes sure we will retry later.
-func (c *LoadbalancerServiceController) handleErr(err error, key interface{}) {
+func (c *LoadbalancerServiceController) handleErr(err error, key string) {
 	if err == nil {
 		c.queue.Forget(key)
 		return
@@ -154,7 +178,7 @@ func (c *LoadbalancerServiceController) updateServiceStatus(key string) error {
 		klog.Infof("Service %s does not exist anymore", key)
 	} else {
 		svc := obj.(*corev1.Service)
-		if svc.Spec.Type != corev1.ServiceTypeLoadBalancer {
+		if svc.Spec.Type != corev1.ServiceTypeLoadBalancer || svc.Spec.LoadBalancerClass != nil || isDefaultRouterService(svc) {
 			return nil
 		}
 		klog.Infof("Process service %s/%s", svc.Namespace, svc.Name)
@@ -208,4 +232,33 @@ func (c *LoadbalancerServiceController) patchStatus(svc *corev1.Service, newStat
 	_, err := helpers.PatchService(c.client.CoreV1(), svc, updated)
 
 	return err
+}
+
+func (c *LoadbalancerServiceController) updateDefaultRouterServiceStatus(ips []string) error {
+	return wait.PollUntilContextTimeout(context.Background(), time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
+		svc, err := c.client.CoreV1().Services(defaultRouterServiceNamespace).Get(ctx, defaultRouterServiceName, metav1.GetOptions{})
+		if err != nil {
+			return false, err
+		}
+		newStatus := &corev1.LoadBalancerStatus{}
+		for _, ip := range ips {
+			newStatus.Ingress = append(newStatus.Ingress, corev1.LoadBalancerIngress{
+				IP: ip,
+			})
+		}
+
+		equal := slices.EqualFunc(svc.Status.LoadBalancer.Ingress, newStatus.Ingress, func(oldIP, newIP corev1.LoadBalancerIngress) bool {
+			return oldIP.IP == newIP.IP
+		})
+		if equal {
+			return true, nil
+		}
+		klog.Infof("Updating default router service status: %v", ips)
+		err = c.patchStatus(svc, newStatus)
+		if err != nil {
+			klog.ErrorS(err, "Unable to patch default router service")
+			return false, nil
+		}
+		return true, nil
+	})
 }

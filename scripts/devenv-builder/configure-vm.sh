@@ -1,12 +1,20 @@
 #!/bin/bash
 set -eo pipefail
 
+SCRIPTDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 BUILD_AND_RUN=true
 INSTALL_BUILD_DEPS=true
 FORCE_FIREWALL=false
 RHEL_SUBSCRIPTION=false
 RHEL_BETA_VERSION=false
 SET_RHEL_RELEASE=true
+DNF_UPDATE=true
+PULL_IMAGES=false
+OPTIONAL_RPMS=false
+DNF_RETRY="${SCRIPTDIR}/../dnf_retry.sh"
+PULL_RETRY="${SCRIPTDIR}/../pull_retry.sh"
+RHOCP_REPO="${SCRIPTDIR}/../get-latest-rhocp-repo.sh"
+MAKE_VERSION="${SCRIPTDIR}/../../Makefile.version.$(uname -m).var"
 
 start=$(date +%s)
 
@@ -17,27 +25,12 @@ function usage() {
     echo "  --no-build-deps           Do not install dependencies for building binaries and RPMs (implies --no-build)"
     echo "  --force-firewall          Install and configure firewalld regardless of other options"
     echo "  --no-set-release-version  Do NOT set the release subscription to the current release version"
+    echo "  --skip-dnf-update         Do NOT run dnf update"
+    echo "  --pull-images             Force pulling of container images before starting MicroShift"
+    echo "  --optional-rpms           Install optional RPMs (OLM, Multus) along with core MicroShift RPMs"
 
     [ -n "$1" ] && echo -e "\nERROR: $1"
     exit 1
-}
-
-function dnf_retry() {
-    local -r mode=$1
-    local -r args=$2
-
-    local retVal=1
-    for _ in $(seq 3) ; do
-        # shellcheck disable=SC2086
-        if ! sudo dnf "${mode}" -y ${args} ; then
-            sudo dnf clean -y all
-        else
-            retVal=0
-            break
-        fi
-    done
-
-    return ${retVal}
 }
 
 while [ $# -gt 1 ]; do
@@ -59,12 +52,43 @@ while [ $# -gt 1 ]; do
         SET_RHEL_RELEASE=false
         shift
         ;;
+    --skip-dnf-update)
+        DNF_UPDATE=false
+        shift
+        ;;
+    --pull-images)
+        PULL_IMAGES=true
+        shift
+        ;;
+    --optional-rpms)
+        OPTIONAL_RPMS=true
+        shift
+        ;;
     *) usage ;;
     esac
 done
 
 if [ $# -ne 1 ]; then
     usage "Wrong number of arguments"
+fi
+
+# The conditional check for presence of the used scripts and files
+# is required because configure-vm.sh can be run as a standalone
+# script when bootstrapping the development environment
+if [ ! -x "${DNF_RETRY}" ] ; then
+    DNF_RETRY=$(mktemp /tmp/dnf_retry.XXXXXXXX.sh)
+    curl -s "https://raw.githubusercontent.com/openshift/microshift/main/scripts/dnf_retry.sh" -o "${DNF_RETRY}"
+    chmod 755 "${DNF_RETRY}"
+fi
+if [ ! -x "${RHOCP_REPO}" ] ; then
+    RHOCP_REPO=$(mktemp /tmp/get-latest-rhocp-repo.XXXXXXXX.sh)
+    curl -s "https://raw.githubusercontent.com/openshift/microshift/main/scripts/get-latest-rhocp-repo.sh" -o "${RHOCP_REPO}"
+    chmod 755 "${RHOCP_REPO}"
+fi
+if [ ! -f "${MAKE_VERSION}" ] ; then
+    MAKE_VERSION=$(mktemp "/tmp/Makefile.version.$(uname -m).XXXXXXXX.var")
+    curl -s "https://raw.githubusercontent.com/openshift/microshift/main/Makefile.version.$(uname -m).var" -o "${MAKE_VERSION}"
+    chmod 644 "${MAKE_VERSION}"
 fi
 
 # Only RHEL requires a subscription
@@ -88,24 +112,37 @@ if ${RHEL_SUBSCRIPTION}; then
     if ! sudo subscription-manager status >&/dev/null; then
         sudo subscription-manager register --auto-attach
     fi
+    sudo subscription-manager config --rhsm.manage_repos=1
 
     if ${SET_RHEL_RELEASE} && ! ${RHEL_BETA_VERSION} ; then
         # https://access.redhat.com/solutions/238533
         source /etc/os-release
         sudo subscription-manager release --set ${VERSION_ID}
         sudo subscription-manager release --show
-        dnf_retry clean all
+        "${DNF_RETRY}" "clean" "all"
+    fi
+
+    # Enable RHEL CDN repos to avoid problems with incomplete RHUI mirrors
+    if ! ${RHEL_BETA_VERSION} ; then
+        OSVERSION=$(awk -F: '{print $5}' /etc/system-release-cpe)
+        sudo subscription-manager repos \
+            --enable "rhel-${OSVERSION}-for-$(uname -m)-baseos-rpms" \
+            --enable "rhel-${OSVERSION}-for-$(uname -m)-appstream-rpms"
     fi
 fi
 
 if ${INSTALL_BUILD_DEPS} || ${BUILD_AND_RUN}; then
-    dnf_retry clean all
-    dnf_retry update
-    dnf_retry install "gcc git golang cockpit make jq selinux-policy-devel rpm-build jq bash-completion avahi-tools"
-    sudo systemctl enable --now cockpit.socket
+    "${DNF_RETRY}" "clean" "all"
+    if ${DNF_UPDATE}; then
+        "${DNF_RETRY}" "update"
+    fi
+    "${DNF_RETRY}" "install" "gcc git golang cockpit make jq selinux-policy-devel rpm-build jq bash-completion avahi-tools createrepo"
+
+    # run only if booted with systemd
+    [[ -d /run/systemd/system ]] &&  sudo systemctl enable --now cockpit.socket
 fi
 
-GO_VER=1.20.10
+GO_VER=1.22.7
 GO_ARCH=$([ "$(uname -m)" == "x86_64" ] && echo "amd64" || echo "arm64")
 GO_INSTALL_DIR="/usr/local/go${GO_VER}"
 if ${INSTALL_BUILD_DEPS} && [ ! -d "${GO_INSTALL_DIR}" ]; then
@@ -134,28 +171,35 @@ fi
 
 if ${RHEL_SUBSCRIPTION}; then
     OSVERSION=$(awk -F: '{print $5}' /etc/system-release-cpe)
-    # This version might not match the version under development because we need
-    # to pull in dependencies that are already released
-    OCPVERSION=4.13
     sudo subscription-manager config --rhsm.manage_repos=1
 
-    if ! ${RHEL_BETA_VERSION} ; then
-        sudo subscription-manager repos \
-            --enable "rhocp-${OCPVERSION}-for-rhel-${OSVERSION}-$(uname -m)-rpms" \
-            --enable "fast-datapath-for-rhel-${OSVERSION}-$(uname -m)-rpms"
-    else
-        OCP_REPO_NAME="rhocp-${OCPVERSION}-for-rhel-${OSVERSION}-mirrorbeta-$(uname -i)-rpms"
+    RHOCP=$("${RHOCP_REPO}")
+    if [[ "${RHOCP}" =~ ^[0-9]{2} ]]; then
+        sudo subscription-manager repos --enable "rhocp-4.${RHOCP}-for-rhel-9-$(uname -m)-rpms"
+    elif [[ "${RHOCP}" =~ ^http ]]; then
+        url=$(echo "${RHOCP}" | cut -d, -f1)
+        ver=$(echo "${RHOCP}" | cut -d, -f2)
+        OCP_REPO_NAME="rhocp-4.${ver}-for-rhel-9-mirrorbeta-$(uname -i)-rpms"
         sudo tee "/etc/yum.repos.d/${OCP_REPO_NAME}.repo" >/dev/null <<EOF
 [${OCP_REPO_NAME}]
-name=Beta rhocp-${OCPVERSION} RPMs for RHEL ${OSVERSION}
-baseurl=https://mirror.openshift.com/pub/openshift-v4/\$basearch/dependencies/rpms/${OCPVERSION}-el${OSVERSION}-beta/
+name=Beta rhocp-4.${ver} RPMs for RHEL 9
+baseurl=${url}
 enabled=1
 gpgcheck=0
 skip_if_unavailable=0
 EOF
+        PREVIOUS_RHOCP=$("${RHOCP_REPO}" $((ver-1)))
+        if [[ "${PREVIOUS_RHOCP}" =~ ^[0-9]{2} ]]; then
+            sudo subscription-manager repos --enable "rhocp-4.${PREVIOUS_RHOCP}-for-rhel-9-$(uname -m)-rpms"
+        fi
+    fi
+
+    # Enable fast-datapath (ovn) only for non-beta. Beta RHEL will use openvswitch from RHOCP beta mirror.
+    if ! ${RHEL_BETA_VERSION}; then
+        sudo subscription-manager repos --enable "fast-datapath-for-rhel-${OSVERSION}-$(uname -m)-rpms"
     fi
 else
-    dnf_retry install centos-release-nfv-common
+    "${DNF_RETRY}" "install" "centos-release-nfv-common"
     sudo dnf copr enable -y @OKD/okd "centos-stream-9-$(uname -m)"
     sudo tee "/etc/yum.repos.d/openvswitch2-$(uname -m)-rpms.repo" >/dev/null <<EOF
 [sig-nfv]
@@ -169,20 +213,30 @@ EOF
 fi
 
 if ${RHEL_SUBSCRIPTION}; then
-    dnf_retry install openshift-clients
+    "${DNF_RETRY}" "install" "openshift-clients"
 else
-    OCC_SRC="https://mirror.openshift.com/pub/openshift-v4/$(uname -m)/dependencies/rpms/4.14-el9-beta"
+    # Assume the current development version on non-RHEL OS
+    OCPVERSION="4.$(cut -d'.' -f2 "${MAKE_VERSION}")"
+    OCC_SRC="https://mirror.openshift.com/pub/openshift-v4/$(uname -m)/dependencies/rpms/${OCPVERSION}-el9-beta"
     OCC_RPM="$(curl -s "${OCC_SRC}/" | grep -o "openshift-clients-4[^\"']*.rpm" | sort | uniq)"
     OCC_LOC="$(mktemp /tmp/openshift-client-XXXXX.rpm)"
     OCC_REM="${OCC_SRC}/${OCC_RPM}"
 
     curl -s "${OCC_REM}" --output "${OCC_LOC}"
-    dnf_retry localinstall "${OCC_LOC}"
+    "${DNF_RETRY}" "localinstall" "${OCC_LOC}"
     rm -f "${OCC_LOC}"
 fi
 
 if ${BUILD_AND_RUN}; then
-    dnf_retry localinstall "$(ls -1 ~/microshift/_output/rpmbuild/RPMS/*/*.rpm)"
+    if ${OPTIONAL_RPMS}; then
+        "${DNF_RETRY}" "localinstall" "$(ls -1 ~/microshift/_output/rpmbuild/RPMS/*/*.rpm)"
+    else
+        createrepo "${HOME}/microshift/_output/rpmbuild"
+        "${DNF_RETRY}" "install" \
+            "microshift microshift-release-info \
+            --repofrompath=microshift-local,${HOME}/microshift/_output/rpmbuild \
+            --setopt=microshift-local.gpgcheck=0"
+    fi
 fi
 
 # Configure OpenShift pull secret
@@ -211,7 +265,7 @@ EOF
 fi
 
 if ${BUILD_AND_RUN} || ${FORCE_FIREWALL}; then
-    dnf_retry install firewalld
+    "${DNF_RETRY}" "install" "firewalld"
     sudo systemctl enable firewalld --now
     sudo firewall-cmd --permanent --zone=trusted --add-source=10.42.0.0/16
     sudo firewall-cmd --permanent --zone=trusted --add-source=169.254.169.1
@@ -226,7 +280,11 @@ if ${BUILD_AND_RUN} || ${FORCE_FIREWALL}; then
 fi
 
 if ${BUILD_AND_RUN}; then
-    sudo systemctl enable crio
+    sudo systemctl enable --now crio
+    if ${PULL_IMAGES}; then
+        # shellcheck disable=SC2046
+        "${PULL_RETRY}" $(rpm -qa | grep -e  "microshift.*-release-info" | xargs rpm -ql | grep $(uname -m).json | xargs jq -r '.images | values[]')
+    fi
     sudo systemctl start microshift
 
     echo ""

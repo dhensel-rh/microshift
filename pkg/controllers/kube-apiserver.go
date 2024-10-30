@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,15 +36,19 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 	kubeapiserver "k8s.io/kubernetes/cmd/kube-apiserver/app"
+	hostassignmentv1 "k8s.io/kubernetes/openshift-kube-apiserver/admission/route/apis/hostassignment/v1"
+	"sigs.k8s.io/yaml"
 
 	configv1 "github.com/openshift/api/config/v1"
 	kubecontrolplanev1 "github.com/openshift/api/kubecontrolplane/v1"
 	"github.com/openshift/library-go/pkg/crypto"
 	"github.com/openshift/library-go/pkg/operator/resource/resourcemerge"
+
 	embedded "github.com/openshift/microshift/assets"
 	"github.com/openshift/microshift/pkg/config"
+	"github.com/openshift/microshift/pkg/config/apiserver"
+	"github.com/openshift/microshift/pkg/util"
 	"github.com/openshift/microshift/pkg/util/cryptomaterial"
-	hostassignmentv1 "k8s.io/kubernetes/openshift-kube-apiserver/admission/route/apis/hostassignment/v1"
 )
 
 const (
@@ -103,22 +108,73 @@ func (s *KubeAPIServer) configure(cfg *config.Config) error {
 	servingCert := cryptomaterial.ServingCertPath(serviceNetworkServingCertDir)
 	servingKey := cryptomaterial.ServingKeyPath(serviceNetworkServingCertDir)
 
-	if err := s.configureAuditPolicy(); err != nil {
+	if err := s.configureAuditPolicy(cfg); err != nil {
 		return fmt.Errorf("failed to configure kube-apiserver audit policy: %w", err)
 	}
 
 	s.masterURL = cfg.ApiServer.URL
 	s.servingCAPath = cryptomaterial.ServiceAccountTokenCABundlePath(certsDir)
-	s.advertiseAddress = cfg.ApiServer.AdvertiseAddress
+	s.advertiseAddress = cfg.ApiServer.AdvertiseAddresses[0]
+
+	namedCerts := []configv1.NamedCertificate{
+		{
+			CertInfo: configv1.CertInfo{
+				CertFile: cryptomaterial.ServingCertPath(cryptomaterial.KubeAPIServerExternalServingCertDir(certsDir)),
+				KeyFile:  cryptomaterial.ServingKeyPath(cryptomaterial.KubeAPIServerExternalServingCertDir(certsDir)),
+			},
+		},
+		{
+			CertInfo: configv1.CertInfo{
+				CertFile: cryptomaterial.ServingCertPath(cryptomaterial.KubeAPIServerLocalhostServingCertDir(certsDir)),
+				KeyFile:  cryptomaterial.ServingKeyPath(cryptomaterial.KubeAPIServerLocalhostServingCertDir(certsDir)),
+			},
+		},
+		{
+			CertInfo: configv1.CertInfo{
+				CertFile: servingCert,
+				KeyFile:  servingKey,
+			},
+		},
+	}
+	if len(cfg.ApiServer.NamedCertificates) > 0 {
+		for _, namedCertsCfg := range cfg.ApiServer.NamedCertificates {
+			//Validate the cert is non-destructive
+			certAllowed, err := util.IsCertAllowed(cfg.ApiServer.AdvertiseAddresses[0], cfg.Network.ClusterNetwork, cfg.Network.ServiceNetwork, namedCertsCfg.CertPath, namedCertsCfg.Names)
+			if err != nil {
+				klog.Warningf("Failed to read NamedCertificate from %s - ignoring: %v", namedCertsCfg.CertPath, err)
+				continue
+			}
+
+			if !certAllowed {
+				klog.Warningf("Certificate %v is not allowed - ignoring", namedCertsCfg)
+				continue
+			}
+
+			cert := []configv1.NamedCertificate{
+				{
+					Names: namedCertsCfg.Names,
+					CertInfo: configv1.CertInfo{
+						CertFile: namedCertsCfg.CertPath,
+						KeyFile:  namedCertsCfg.KeyPath,
+					},
+				},
+			}
+			// prepend the named certs to the beginning of the slice (so it will take precedence for same SNI)
+			namedCerts = append(cert, namedCerts...)
+		}
+	}
 
 	overrides := &kubecontrolplanev1.KubeAPIServerConfig{
 		APIServerArguments: map[string]kubecontrolplanev1.Arguments{
-			"advertise-address": {s.advertiseAddress},
-			"audit-policy-file": {filepath.Join(config.DataDir, "/resources/kube-apiserver-audit-policies/default.yaml")},
-			"client-ca-file":    {clientCABundlePath},
-			"etcd-cafile":       {cryptomaterial.CACertPath(cryptomaterial.EtcdSignerDir(certsDir))},
-			"etcd-certfile":     {cryptomaterial.ClientCertPath(etcdClientCertDir)},
-			"etcd-keyfile":      {cryptomaterial.ClientKeyPath(etcdClientCertDir)},
+			"advertise-address":   {s.advertiseAddress},
+			"audit-policy-file":   {filepath.Join(config.DataDir, "/resources/kube-apiserver-audit-policies/default.yaml")},
+			"audit-log-maxage":    {strconv.Itoa(cfg.ApiServer.AuditLog.MaxFileAge)},
+			"audit-log-maxbackup": {strconv.Itoa(cfg.ApiServer.AuditLog.MaxFiles)},
+			"audit-log-maxsize":   {strconv.Itoa(cfg.ApiServer.AuditLog.MaxFileSize)},
+			"client-ca-file":      {clientCABundlePath},
+			"etcd-cafile":         {cryptomaterial.CACertPath(cryptomaterial.EtcdSignerDir(certsDir))},
+			"etcd-certfile":       {cryptomaterial.ClientCertPath(etcdClientCertDir)},
+			"etcd-keyfile":        {cryptomaterial.ClientKeyPath(etcdClientCertDir)},
 			"etcd-servers": {
 				"https://localhost:2379",
 			},
@@ -133,6 +189,7 @@ func (s *KubeAPIServer) configure(cfg *config.Config) error {
 			// limitations. For this, we prefer using names and IPs as a fallback, supporting both single
 			// and multi node.
 			"kubelet-preferred-address-types": {"Hostname", "InternalIP"},
+			"service-cluster-ip-range":        {strings.Join(cfg.Network.ServiceNetwork, ",")},
 
 			"proxy-client-cert-file":           {cryptomaterial.ClientCertPath(aggregatorClientCertDir)},
 			"proxy-client-key-file":            {cryptomaterial.ClientKeyPath(aggregatorClientCertDir)},
@@ -185,36 +242,16 @@ func (s *KubeAPIServer) configure(cfg *config.Config) error {
 			},
 			ServingInfo: configv1.HTTPServingInfo{
 				ServingInfo: configv1.ServingInfo{
-					BindAddress:   net.JoinHostPort("0.0.0.0", strconv.Itoa(cfg.ApiServer.Port)),
-					MinTLSVersion: string(fixedTLSProfile.MinTLSVersion),
-					CipherSuites:  crypto.OpenSSLToIANACipherSuites(fixedTLSProfile.Ciphers),
-					NamedCertificates: []configv1.NamedCertificate{
-						{
-							CertInfo: configv1.CertInfo{
-								CertFile: cryptomaterial.ServingCertPath(cryptomaterial.KubeAPIServerExternalServingCertDir(certsDir)),
-								KeyFile:  cryptomaterial.ServingKeyPath(cryptomaterial.KubeAPIServerExternalServingCertDir(certsDir)),
-							},
-						},
-						{
-							CertInfo: configv1.CertInfo{
-								CertFile: cryptomaterial.ServingCertPath(cryptomaterial.KubeAPIServerLocalhostServingCertDir(certsDir)),
-								KeyFile:  cryptomaterial.ServingKeyPath(cryptomaterial.KubeAPIServerLocalhostServingCertDir(certsDir)),
-							},
-						},
-						{
-							CertInfo: configv1.CertInfo{
-								CertFile: servingCert,
-								KeyFile:  servingKey,
-							},
-						},
-					},
+					BindAddress:       net.JoinHostPort("0.0.0.0", strconv.Itoa(cfg.ApiServer.Port)),
+					MinTLSVersion:     string(fixedTLSProfile.MinTLSVersion),
+					CipherSuites:      crypto.OpenSSLToIANACipherSuites(fixedTLSProfile.Ciphers),
+					NamedCertificates: namedCerts,
 				},
 			},
 		},
 		ServiceAccountPublicKeyFiles: []string{
 			filepath.Join(config.DataDir, "/resources/kube-apiserver/secrets/service-account-key/service-account.pub"),
 		},
-		ServicesSubnet:        cfg.Network.ServiceNetwork[0],
 		ServicesNodePortRange: cfg.Network.ServiceNodePortRange,
 	}
 
@@ -255,43 +292,17 @@ func (s *KubeAPIServer) configure(cfg *config.Config) error {
 	return nil
 }
 
-func (s *KubeAPIServer) configureAuditPolicy() error {
-	data := []byte(`
-apiVersion: audit.k8s.io/v1
-kind: Policy
-metadata:
-  name: Default
-# Don't generate audit events for all requests in RequestReceived stage.
-omitStages:
-- "RequestReceived"
-rules:
-# Don't log requests for events
-- level: None
-  resources:
-  - group: ""
-    resources: ["events"]
-# Don't log oauth tokens as metadata.name is the secret
-- level: None
-  resources:
-  - group: "oauth.openshift.io"
-    resources: ["oauthaccesstokens", "oauthauthorizetokens"]
-# Don't log authenticated requests to certain non-resource URL paths.
-- level: None
-  userGroups: ["system:authenticated", "system:unauthenticated"]
-  nonResourceURLs:
-  - "/api*" # Wildcard matching.
-  - "/version"
-  - "/healthz"
-  - "/readyz"
-# A catch-all rule to log all other requests at the Metadata level.
-- level: Metadata
-  # Long-running requests like watches that fall under this rule will not
-  # generate an audit event in RequestReceived.
-  omitStages:
-  - "RequestReceived"`)
-
+func (s *KubeAPIServer) configureAuditPolicy(cfg *config.Config) error {
+	p, err := apiserver.GetPolicy(cfg.ApiServer.AuditLog.Profile)
+	if err != nil {
+		return err
+	}
 	path := filepath.Join(config.DataDir, "resources", "kube-apiserver-audit-policies", "default.yaml")
 	if err := os.MkdirAll(filepath.Dir(path), os.FileMode(0700)); err != nil {
+		return err
+	}
+	data, err := yaml.Marshal(p)
+	if err != nil {
 		return err
 	}
 	return os.WriteFile(path, data, 0400)

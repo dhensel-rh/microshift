@@ -1,7 +1,9 @@
-from robot.libraries.BuiltIn import BuiltIn
-from libostree import remote_sudo_rc, remote_sudo
-from typing import List
 import re
+from typing import List
+
+from robot.libraries.BuiltIn import BuiltIn
+
+from libostree import remote_sudo, remote_sudo_rc
 
 ACCESS_CHECK_MAP = {
     "/var/lib/microshift/version": ["cat"],
@@ -29,39 +31,6 @@ CONTEXT_CHECK_MAP = {
     ],
 }
 
-# This list should only ever change if we alter the SELinux policy or
-# upstream container linux package changes something in these contexts,
-# those events should be rare. However, if anything changes these contexts, the test should
-# fail so we can decide what that means for MicroShift and update the list then.
-EXPECTED_FCONTEXT_LIST = [
-    "/etc/kubernetes(/.*)?",
-    "/etc/microshift(/.*)?",
-    "/exports(/.*)?",
-    "/usr/bin/microshift",
-    "/usr/bin/microshift-etcd",
-    "/usr/lib/microshift(/.*)?",
-    "/usr/local/bin/microshift",
-    "/usr/local/bin/microshift-etcd",
-    "/usr/local/s?bin/hyperkube.*",
-    "/usr/local/s?bin/kubelet.*",
-    "/usr/s?bin/hyperkube.*",
-    "/usr/s?bin/kubelet.*",
-    "/var/lib/buildkit(/.*)?",
-    "/var/lib/cni(/.*)?",
-    "/var/lib/containerd(/.*)?",
-    "/var/lib/containers(/.*)?",
-    "/var/lib/docker(/.*)?",
-    "/var/lib/docker-latest(/.*)?",
-    "/var/lib/kubelet(/.*)?",
-    "/var/lib/lxc(/.*)?",
-    "/var/lib/lxd(/.*)?",
-    "/var/lib/microshift(/.*)?",
-    "/var/lib/microshift-backups(/.*)?",
-    "/var/lib/microshift.saved(/.*)?",
-    "/var/lib/ocid(/.*)?",
-    "/var/lib/registry(/.*)?",
-]
-
 SOURCE_TARGET_TRANSITION = {
     "container_t": ["container_var_lib_t"]
 }
@@ -71,10 +40,6 @@ SOURCE_TARGET_TRANSITION = {
 DOMAIN_PERMISSION_IGNORE_REGEX = {
     "^file_type [a-z_]+:filesystem$": ["associate"],
 }
-
-
-def get_expected_ocp_microshift_fcontext_list() -> List[str]:
-    return EXPECTED_FCONTEXT_LIST
 
 
 # Here we care about matching what our SELinux policy says with what the host says for contexts.

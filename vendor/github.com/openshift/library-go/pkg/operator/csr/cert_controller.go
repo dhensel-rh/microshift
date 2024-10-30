@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/openshift/library-go/pkg/controller/factory"
+	"github.com/openshift/library-go/pkg/operator/certrotation"
 	"github.com/openshift/library-go/pkg/operator/events"
 
 	certificates "k8s.io/api/certificates/v1"
@@ -63,6 +64,8 @@ type ClientCertOption struct {
 	SecretName string
 	// AdditonalSecretData contains data that will be added into client certificate secret besides tls.key/tls.crt
 	AdditonalSecretData map[string][]byte
+	// AdditionalAnnotations is a collection of annotations set for the secret
+	AdditionalAnnotations certrotation.AdditionalAnnotations
 }
 
 // clientCertificateController implements the common logic of hub client certification creation/rotation. It
@@ -137,7 +140,10 @@ func NewClientCertificateController(
 		}, c.EventFilterFunc, hubCSRInformer.Informer()).
 		WithSync(c.sync).
 		ResyncEvery(ControllerResyncInterval).
-		ToController(controllerName, recorder), nil
+		ToController(
+			controllerName, // don't change what is passed here unless you also remove the old FooDegraded condition
+			recorder,
+		), nil
 }
 
 func (c *clientCertificateController) sync(ctx context.Context, syncCtx factory.SyncContext) error {
@@ -146,14 +152,17 @@ func (c *clientCertificateController) sync(ctx context.Context, syncCtx factory.
 	switch {
 	case errors.IsNotFound(err):
 		secret = &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace: c.SecretNamespace,
-				Name:      c.SecretName,
-			},
+			ObjectMeta: certrotation.NewTLSArtifactObjectMeta(
+				c.SecretName,
+				c.SecretNamespace,
+				c.AdditionalAnnotations,
+			),
 		}
 	case err != nil:
 		return fmt.Errorf("unable to get secret %q: %w", c.SecretNamespace+"/"+c.SecretName, err)
 	}
+
+	needsMetadataUpdate := c.AdditionalAnnotations.EnsureTLSMetadataUpdate(&secret.ObjectMeta)
 
 	// reconcile pending csr if exists
 	if len(c.csrName) > 0 {
@@ -177,6 +186,10 @@ func (c *clientCertificateController) sync(ctx context.Context, syncCtx factory.
 		syncCtx.Recorder().Eventf("ClientCertificateCreated", "A new client certificate for %s is available", c.controllerName)
 		c.reset()
 		return nil
+	} else if needsMetadataUpdate && len(secret.ResourceVersion) > 0 {
+		if err := c.saveSecret(secret); err != nil {
+			return err
+		}
 	}
 
 	// create a csr to request new client certificate if

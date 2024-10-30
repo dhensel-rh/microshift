@@ -5,13 +5,13 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"text/template"
 
-	"sigs.k8s.io/yaml"
+	"k8s.io/kubernetes/pkg/apis/core"
 
 	"github.com/openshift/microshift/pkg/assets"
 	"github.com/openshift/microshift/pkg/config"
-	"github.com/openshift/microshift/pkg/config/lvmd"
 	"github.com/openshift/microshift/pkg/release"
 )
 
@@ -25,14 +25,21 @@ func renderParamsFromConfig(cfg *config.Config, extra assets.RenderParams) asset
 		"ReleaseImage": release.Image,
 		"NodeName":     cfg.CanonicalNodeName(),
 		"NodeIP":       cfg.Node.NodeIP,
-		"ClusterCIDR":  cfg.Network.ClusterNetwork[0],
-		"ServiceCIDR":  cfg.Network.ServiceNetwork[0],
+		"ClusterCIDR":  strings.Join(cfg.Network.ClusterNetwork, ","),
+		"ServiceCIDR":  strings.Join(cfg.Network.ServiceNetwork, ","),
 		"ClusterDNS":   cfg.Network.DNS,
 		"BaseDomain":   cfg.DNS.BaseDomain,
 	}
+	ipFamily := core.IPFamilyPolicySingleStack
+	if cfg.IsIPv4() && cfg.IsIPv6() {
+		ipFamily = core.IPFamilyPolicyPreferDualStack
+	}
+	params["IPFamily"] = ipFamily
+
 	for k, v := range extra {
 		params[k] = v
 	}
+
 	return params
 }
 
@@ -46,19 +53,4 @@ func renderTemplate(tb []byte, data assets.RenderParams) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
-}
-
-func renderLvmdParams(l *lvmd.Lvmd) (assets.RenderParams, error) {
-	r := make(assets.RenderParams)
-	b, err := yaml.Marshal(l)
-	if err != nil {
-		return nil, err
-	}
-	content := string(b)
-	if l.Message != "" {
-		content = fmt.Sprintf("# %s\n%s", l.Message, content)
-	}
-	r["lvmd"] = content
-	r["SocketName"] = l.SocketName
-	return r, nil
 }
