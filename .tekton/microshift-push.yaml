@@ -24,7 +24,7 @@ spec:
   - name: output-image
     value: quay.io/redhat-user-workloads/microshift-build-tenant/microshift:{{revision}}
   - name: dockerfile
-    value: Dockerfile
+    value: packaging/imagemode/Containerfile_416
   pipelineSpec:
     description: |
       This pipeline is ideal for building container images from a Containerfile while maintaining trust after pipeline customization.
