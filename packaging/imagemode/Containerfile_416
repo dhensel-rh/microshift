@@ -13,7 +13,7 @@ RUN dnf install -y avahi-tools
 
 # Create a default 'redhat' user with the specified password.
 # Add it to the 'wheel' group to allow for running sudo commands.
-ARG USER_PASSWD
+ARG USER_PASSWD=redhat
 RUN if [ -z "${USER_PASSWD}" ] ; then \
         echo USER_PASSWD is a mandatory build argument && exit 1 ; \
     fi
